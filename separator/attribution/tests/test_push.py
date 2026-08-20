@@ -267,7 +267,51 @@ def test_sweeper_requeues_lost_work(monkeypatch, app_instance):
     assert resolved[0][0][2] == "K7QX9M"
     assert pushed == [(stuck.id, str(app_instance.id))]
 
-    # Already swept: a second run must not queue the resolve again.
+    # Already swept: neither stage may be queued a second time (the lease holds).
     resolved.clear()
-    tasks.sweep_pending_attributions()
-    assert resolved == []
+    pushed.clear()
+    assert tasks.sweep_pending_attributions() == {"resolve": 0, "push": 0}
+    assert resolved == [] and pushed == []
+    stuck.refresh_from_db()
+    assert stuck.push_state == DealAttribution.PUSH_QUEUED
+
+
+def test_terminal_rows_are_not_swept_again(monkeypatch, app_instance):
+    pushed = []
+    monkeypatch.setattr(tasks.push_deal_attribution, "delay", lambda *a: pushed.append(a))
+    failed = DealAttribution.objects.create(
+        phone=PHONE,
+        app_instance_id=str(app_instance.id),
+        attribution_source=DealAttribution.SOURCE_NONE,
+        attribution_status=DealAttribution.STATUS_CODE_MISSING,
+        push_state=DealAttribution.PUSH_FAILED,
+        error="contact/deal not found after 11 attempts",
+    )
+    DealAttribution.objects.filter(pk=failed.pk).update(
+        created_at=timezone.now() - timedelta(hours=1)
+    )
+    assert tasks.sweep_pending_attributions()["push"] == 0
+    assert pushed == []
+
+
+def test_push_marks_terminal_state(monkeypatch, app_instance, attribution):
+    calls = []
+    monkeypatch.setattr(
+        tasks,
+        "call_method",
+        fake_bitrix(
+            {
+                "crm.duplicate.findbycomm": {"result": {"CONTACT": [9014]}},
+                "crm.deal.list": {
+                    "result": [{"ID": "617", "DATE_CREATE": timezone.now().isoformat()}]
+                },
+                "imopenlines.crm.chat.getLastId": {"result": None},
+                "crm.deal.fields": {"result": ALL_FIELDS},
+                "crm.deal.update": {"result": True},
+            },
+            calls,
+        ),
+    )
+    tasks.push_deal_attribution(attribution.id, str(app_instance.id))
+    attribution.refresh_from_db()
+    assert attribution.push_state == DealAttribution.PUSH_DONE

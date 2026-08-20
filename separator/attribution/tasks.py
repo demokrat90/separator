@@ -29,8 +29,9 @@ logger = logging.getLogger("django")
 
 # One claim per phone per day.
 CLAIM_WINDOW_HOURS = 24
-# A deal created before this margin cannot be the one this conversation started.
-DEAL_FRESHNESS_MINUTES = 30
+# Allowance for clock skew between the portal and us; anything created earlier
+# than (first inbound - this) belongs to an older conversation.
+DEAL_FRESHNESS_MINUTES = 5
 PUSH_MAX_RETRIES = 10
 PUSH_BACKOFF_MAX = 600
 # The sweeper only looks at recent work; older rows are a manual matter.
@@ -60,12 +61,16 @@ def _error(response):
 
 
 def _lock_phone(phone):
-    """Serialize concurrent first messages of one number across workers."""
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", [f"attr:{phone}"])
-    except Exception as exc:  # non-Postgres or permission issue: not fatal
-        logger.warning("attribution: advisory lock unavailable: %s", exc)
+    """Serialize concurrent first messages of one number across workers.
+
+    The lock is released when the surrounding transaction ends. Errors are not
+    swallowed on purpose: a failed statement poisons the transaction, so a
+    silent except here would only turn one clear error into a confusing one.
+    """
+    if connection.vendor != "postgresql":
+        return
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", [f"attr:{phone}"])
 
 
 @shared_task(queue="bitrix", **RETRY_KWARGS)
@@ -130,8 +135,11 @@ def resolve(phone, wamid, code, referral, ts, app_instance_id=None):
     if app_instance_id:
         try:
             push_deal_attribution.delay(attribution.id, str(app_instance_id))
+            DealAttribution.objects.filter(pk=attribution.pk).update(
+                push_state=DealAttribution.PUSH_QUEUED
+            )
         except Exception as exc:
-            # pushed_to_bitrix_at stays empty; the sweeper retries later.
+            # push_state stays `pending`; the sweeper picks it up.
             logger.error("attribution: could not queue push for %s: %s", attribution.id, exc)
 
     return {"attribution_id": attribution.id, "source": source, "status": status}
@@ -173,7 +181,10 @@ def find_deal_id(app_instance, phone, not_before=None):
                 try:
                     created = datetime.fromisoformat(deal["DATE_CREATE"])
                 except (TypeError, ValueError):
-                    created = None
+                    logger.warning(
+                        "attribution: unparseable DATE_CREATE %r on deal %s",
+                        deal.get("DATE_CREATE"), deal_id,
+                    )
             candidates.append((deal_id, created))
 
     if not candidates:
@@ -192,9 +203,9 @@ def find_deal_id(app_instance, phone, not_before=None):
     if not not_before:
         return newest_id, True
     for deal_id, created in candidates:
-        # A deal with no parseable DATE_CREATE is treated as fresh rather than
-        # blocking attribution forever.
-        if created is None or created >= not_before:
+        # An unverifiable creation time is not a green light: writing into the
+        # wrong deal is worse than not attributing this one.
+        if created is not None and created >= not_before:
             return deal_id, True
     return newest_id, False
 
@@ -242,7 +253,8 @@ def push_deal_attribution(self, attribution_id, app_instance_id):
         if last_attempt:
             reason = "no deal created for this conversation" if deal_id else "contact/deal not found"
             attribution.error = f"{reason} after {attempt + 1} attempts"
-            attribution.save(update_fields=["error", "updated_at"])
+            attribution.push_state = DealAttribution.PUSH_FAILED
+            attribution.save(update_fields=["error", "push_state", "updated_at"])
             logger.warning(
                 "attribution: %s for %s (attribution %s)",
                 reason, attribution.phone, attribution.id,
@@ -260,7 +272,8 @@ def push_deal_attribution(self, attribution_id, app_instance_id):
         # Another conversation already owns this deal - keep our row unattached.
         attribution.refresh_from_db()
         attribution.error = "; ".join(notes + [f"deal {deal_id} already attributed"]) or None
-        attribution.save(update_fields=["error", "updated_at"])
+        attribution.push_state = DealAttribution.PUSH_FAILED
+        attribution.save(update_fields=["error", "push_state", "updated_at"])
         return "deal already attributed"
 
     chat_response = call_method(
@@ -297,7 +310,14 @@ def push_deal_attribution(self, attribution_id, app_instance_id):
             attribution.pushed_to_bitrix_at = timezone.now()
 
     attribution.error = "; ".join([note for note in notes if note]) or None
-    attribution.save(update_fields=["chat_ref", "pushed_to_bitrix_at", "error", "updated_at"])
+    # A rejected update is terminal: the spec says do not fail, and re-sending
+    # the same rejected payload every 10 minutes helps nobody.
+    attribution.push_state = (
+        DealAttribution.PUSH_DONE if attribution.pushed_to_bitrix_at else DealAttribution.PUSH_FAILED
+    )
+    attribution.save(
+        update_fields=["chat_ref", "pushed_to_bitrix_at", "push_state", "error", "updated_at"]
+    )
     _link_messages_to_deal(attribution, deal_id)
 
     return {
@@ -310,10 +330,9 @@ def push_deal_attribution(self, attribution_id, app_instance_id):
 def _link_messages_to_deal(attribution, deal_id):
     """Stamp the deal on the messages of this conversation (by payload time)."""
     events = MessageEvent.objects.filter(phone=attribution.phone, deal_id__isnull=True)
-    if attribution.app_instance_id:
-        events = events.filter(
-            Q(app_instance_id=attribution.app_instance_id) | Q(app_instance_id__isnull=True)
-        )
+    # Only this portal's events: an event recorded without a portal must never
+    # be adopted by whoever resolves first.
+    events = events.filter(app_instance_id=attribution.app_instance_id)
     if attribution.first_inbound_at:
         start = attribution.first_inbound_at - timedelta(hours=1)
         end = attribution.first_inbound_at + timedelta(days=30)
@@ -356,13 +375,22 @@ def sweep_pending_attributions():
         )
         requeued["resolve"] += 1
 
+    # Only rows nobody has queued yet (`pending`). `queued` rows belong to a
+    # live retry chain, `done`/`failed` are terminal.
     unpushed = DealAttribution.objects.filter(
+        push_state=DealAttribution.PUSH_PENDING,
         pushed_to_bitrix_at__isnull=True,
         app_instance_id__isnull=False,
         created_at__gte=oldest,
         created_at__lte=newest,
     )[:200]
-    for attribution in unpushed:
+    for attribution in list(unpushed):
+        # Conditional claim: two sweepers cannot queue the same row twice.
+        claimed = DealAttribution.objects.filter(
+            pk=attribution.pk, push_state=DealAttribution.PUSH_PENDING
+        ).update(push_state=DealAttribution.PUSH_QUEUED)
+        if not claimed:
+            continue
         push_deal_attribution.delay(attribution.id, attribution.app_instance_id)
         requeued["push"] += 1
 

@@ -148,3 +148,38 @@ def test_rate_limit_counts_the_proxy_seen_ip_not_the_forged_one(client, settings
     # The spoofed first entry changes every time; the limit still bites.
     assert 429 in codes
     cache.clear()
+
+
+def test_unknown_boolean_values_are_false(client, settings):
+    settings.ATTR_API_KEY = KEY
+    for value in ["maybe", "off", 0, None, "False"]:
+        response = client.post(
+            reverse("attribution:click"),
+            data={"is_test": value},
+            content_type="application/json",
+            headers={"x-attr-key": KEY},
+        )
+        token = ClickToken.objects.get(token=response.json()["token"])
+        assert token.is_test is False, value
+
+    for value in ["true", "1", 1, True, "YES"]:
+        response = client.post(
+            reverse("attribution:click"),
+            data={"is_test": value},
+            content_type="application/json",
+            headers={"x-attr-key": KEY},
+        )
+        token = ClickToken.objects.get(token=response.json()["token"])
+        assert token.is_test is True, value
+
+
+def test_oversized_payload_is_rejected_and_raw_is_bounded(client, settings):
+    settings.ATTR_API_KEY = KEY
+    big = client.post(
+        reverse("attribution:click"),
+        data={"site": "photon", "junk": "x" * 40000},
+        content_type="application/json",
+        headers={"x-attr-key": KEY},
+    )
+    assert big.status_code == 413
+    assert ClickToken.objects.count() == 0

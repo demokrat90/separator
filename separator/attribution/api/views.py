@@ -5,6 +5,8 @@ Fail closed: with no key configured, every call is rejected.
 """
 
 import hmac
+import ipaddress
+import json
 import logging
 
 from django.conf import settings
@@ -50,16 +52,25 @@ STRING_FIELDS = (
 def _client_ip(request):
     """IP for rate limiting.
 
-    Behind exactly one reverse proxy (Caddy) the trustworthy entry of
-    X-Forwarded-For is the LAST one - the address the proxy itself saw. The
-    first entry is client supplied and can be forged to dodge the limit.
+    X-Forwarded-For is only consulted when the connection itself came from a
+    private address, i.e. through our own reverse proxy (Caddy on the docker
+    network). Of that header the LAST entry is used - the address the proxy
+    actually saw; earlier entries are client supplied and can be forged.
+    A request that reaches the app directly is rate limited by its real peer.
     """
+    remote_addr = request.META.get("REMOTE_ADDR", "")
+    if not _is_private(remote_addr):
+        return remote_addr
     forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
-    if forwarded:
-        parts = [part.strip() for part in forwarded.split(",") if part.strip()]
-        if parts:
-            return parts[-1]
-    return request.META.get("REMOTE_ADDR", "")
+    parts = [part.strip() for part in forwarded.split(",") if part.strip()]
+    return parts[-1] if parts else remote_addr
+
+
+def _is_private(address):
+    try:
+        return ipaddress.ip_address(address).is_private
+    except ValueError:
+        return False
 
 
 def _rate_limited(request):
@@ -97,7 +108,8 @@ def health(request):
 
 
 MAX_BODY_BYTES = 32 * 1024
-FALSE_VALUES = {"0", "false", "no", "off", ""}
+MAX_RAW_BYTES = 32 * 1024
+TRUE_VALUES = {"1", "true", "yes", "on"}
 
 _MAX_LENGTHS = {
     field.name: field.max_length
@@ -118,13 +130,25 @@ def _clean(value, field):
 
 
 def _as_bool(value):
+    """Strict: only an explicit truthy value is True, anything else is False."""
     if isinstance(value, bool):
         return value
-    if value is None:
-        return False
     if isinstance(value, (int, float)):
         return bool(value)
-    return str(value).strip().lower() not in FALSE_VALUES
+    if value is None:
+        return False
+    return str(value).strip().lower() in TRUE_VALUES
+
+
+def _bounded_raw(payload):
+    """The site's payload is kept verbatim, but it may not grow unbounded."""
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return {"_error": "payload not serializable"}
+    if len(encoded.encode("utf-8")) > MAX_RAW_BYTES:
+        return {"_truncated": True, "_keys": sorted(payload)[:100]}
+    return payload
 
 
 @api_view(["POST"])
@@ -151,7 +175,7 @@ def click(request):
         normalize_ga_client_id(payload.get("ga_client_id")), "ga_client_id"
     )
     values["is_test"] = _as_bool(payload.get("is_test", False))
-    values["raw"] = payload
+    values["raw"] = _bounded_raw(payload)
     values["schema_version"] = SCHEMA_VERSION
 
     token = None

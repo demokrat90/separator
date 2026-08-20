@@ -168,7 +168,23 @@ class DealAttribution(models.Model):
         blank=True,
         related_name="deal_attributions",
     )
+    PUSH_PENDING = "pending"
+    PUSH_QUEUED = "queued"
+    PUSH_DONE = "done"
+    PUSH_FAILED = "failed"
+    PUSH_STATE_CHOICES = [
+        (PUSH_PENDING, "pending"),
+        (PUSH_QUEUED, "queued"),
+        (PUSH_DONE, "done"),
+        (PUSH_FAILED, "failed"),
+    ]
+
     referral = models.JSONField(null=True, blank=True)
+    # Lease for the sweeper: only `pending` rows are (re)queued, `failed` is a
+    # terminal state a human looks at. Keeps retry chains from multiplying.
+    push_state = models.CharField(
+        max_length=16, choices=PUSH_STATE_CHOICES, default=PUSH_PENDING, db_index=True
+    )
     pushed_to_bitrix_at = models.DateTimeField(null=True, blank=True)
     error = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
