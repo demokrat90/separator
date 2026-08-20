@@ -1,0 +1,154 @@
+# Photon deployment of estvita/separator (fork demokrat90/separator, branch photon)
+# Minimal stack: postgres 16 + redis 7 + web + 2 celery workers + beat.
+# Dropped vs upstream: asterx, flower, worker_olx/waweb/bitbot/waba_messages as separate
+# services (their queues are consumed by worker-misc), redis-stack (not needed, see report).
+
+x-build-config: &build-config
+  context: .
+  dockerfile: ./Dockerfile
+  args:
+    DJANGO_SETTINGS_MODULE: config.settings.production
+    ASTERX_SERVER: "False"
+
+x-django-env: &django-env
+  POSTGRES_DB: ${POSTGRES_DB:-separator}
+  POSTGRES_USER: ${POSTGRES_USER:-separator}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-separator}
+  POSTGRES_HOST: db
+  POSTGRES_PORT: 5432
+  DATABASE_URL: postgres://${POSTGRES_USER:-separator}:${POSTGRES_PASSWORD:-separator}@db:5432/${POSTGRES_DB:-separator}
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/0
+  DJANGO_SETTINGS_MODULE: config.settings.production
+
+x-django-common: &django-common
+  build: *build-config
+  image: separator_photon_django
+  restart: unless-stopped
+  env_file:
+    - .env
+  volumes:
+    - .:/app
+  networks:
+    - separator
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+volumes:
+  separator_postgres_data: {}
+  separator_postgres_backups: {}
+  separator_redis_data: {}
+
+networks:
+  separator:
+    name: separator-net
+  caddy:
+    external: true
+    name: postiz_postiz-network
+
+services:
+  db:
+    image: postgres:16
+    container_name: separator-postgres
+    restart: unless-stopped
+    volumes:
+      - separator_postgres_data:/var/lib/postgresql/data
+      - separator_postgres_backups:/backups
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-separator}
+      POSTGRES_USER: ${POSTGRES_USER:-separator}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-separator}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-separator} -d ${POSTGRES_DB:-separator}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - separator
+
+  redis:
+    image: redis:7-alpine
+    container_name: separator-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - separator_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - separator
+
+  web:
+    <<: *django-common
+    container_name: separator-web
+    command: /start
+    environment:
+      <<: *django-env
+    networks:
+      - separator
+      - caddy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  worker-waba:
+    <<: *django-common
+    container_name: separator-worker-waba
+    command: /start-celeryworker
+    hostname: waba
+    environment:
+      <<: *django-env
+      CELERY_QUEUE: waba,waba_messages
+      CELERY_CONCURRENCY: "1"
+      CELERY_MAX_MEMORY_PER_CHILD: "250000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Everything else: bitrix (open-line connector), default, plus the queues we do not
+  # run dedicated workers for. Subscribing costs nothing and keeps tasks from
+  # silently piling up in an unconsumed queue.
+  worker-misc:
+    <<: *django-common
+    container_name: separator-worker-misc
+    command: /start-celeryworker
+    hostname: misc
+    environment:
+      <<: *django-env
+      CELERY_QUEUE: bitrix,default,bitbot,olx,waweb
+      CELERY_CONCURRENCY: "1"
+      CELERY_MAX_MEMORY_PER_CHILD: "250000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  beat:
+    <<: *django-common
+    container_name: separator-beat
+    command: /start-celerybeat
+    environment:
+      <<: *django-env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started

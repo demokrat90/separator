@@ -42,7 +42,7 @@ class App(models.Model):
     access_token = EncryptedCharField(max_length=2000, default='',
                                     help_text="System admin user access_token")
     openai_api_key = EncryptedCharField(max_length=2000, blank=True, null=True)
-    api_version = models.IntegerField(default=20)
+    api_version = models.IntegerField(default=21)
     verify_token = models.CharField(
         max_length=100,
         default=uuid.uuid4,
