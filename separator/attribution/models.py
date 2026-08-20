@@ -6,7 +6,10 @@ deleted WABA entity can never take attribution data (or the message flow) down.
 Message text is never stored - only its length and sha256 hash.
 """
 
+from datetime import timedelta
+
 from django.db import models
+from django.utils import timezone
 
 SCHEMA_VERSION = 1
 
@@ -109,9 +112,12 @@ class MessageEvent(models.Model):
     # Which rule decided author_type, so rows written before the bot/human rule
     # was verified in the field stay distinguishable from rows written after.
     author_rule_version = models.CharField(max_length=32, default=AUTHOR_RULE_VERSION)
-    # wamid (globally unique) for WhatsApp messages; for outbound connector
-    # events `b24:<app_instance>:<bitrix message id>`.
-    message_id = models.CharField(max_length=255, unique=True)
+    # Always a wamid - that is what delivery statuses are keyed by. Outbound
+    # rows are written before the send, so it stays empty until Graph answers.
+    message_id = models.CharField(max_length=255, null=True, blank=True)
+    # Bitrix message id of an outbound message (unique per portal), used as the
+    # idempotency key while the wamid is not known yet.
+    bitrix_message_id = models.CharField(max_length=64, null=True, blank=True, db_index=True)
     # id of the message this one replies to (WhatsApp `context.id`).
     reply_to_id = models.CharField(max_length=255, null=True, blank=True)
     text_len = models.PositiveIntegerField(default=0)
@@ -126,9 +132,21 @@ class MessageEvent(models.Model):
     class Meta:
         ordering = ("-created_at",)
         indexes = [models.Index(fields=["phone", "direction", "ts"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["message_id"],
+                condition=models.Q(message_id__isnull=False),
+                name="attribution_message_wamid_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["app_instance_id", "bitrix_message_id"],
+                condition=models.Q(bitrix_message_id__isnull=False),
+                name="attribution_message_b24_unique",
+            ),
+        ]
 
     def __str__(self):
-        return f"{self.direction} {self.phone} {self.message_id}"
+        return f"{self.direction} {self.phone} {self.message_id or self.bitrix_message_id}"
 
 
 class StatusEvent(models.Model):
@@ -145,6 +163,10 @@ class StatusEvent(models.Model):
     conversation = models.JSONField(null=True, blank=True)
     pricing = models.JSONField(null=True, blank=True)
     errors = models.JSONField(null=True, blank=True)
+    # The whole status object as Meta sent it. Under per-message pricing (PMP)
+    # the `conversation` object is not sent at all, so the parsed columns above
+    # can be empty while the billing facts live here and in `pricing`.
+    raw = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
@@ -229,3 +251,19 @@ class DealAttribution(models.Model):
 
     def __str__(self):
         return f"{self.phone} -> {self.deal_id or 'pending'}"
+
+
+def current_deal_id(phone, app_instance_id=None, within_days=30):
+    """Deal this number currently belongs to, or None.
+
+    One indexed query: the freshest attribution that actually reached Bitrix.
+    """
+    query = DealAttribution.objects.filter(
+        phone=phone,
+        push_state=DealAttribution.PUSH_DONE,
+        deal_id__isnull=False,
+        created_at__gte=timezone.now() - timedelta(days=within_days),
+    )
+    if app_instance_id:
+        query = query.filter(app_instance_id=app_instance_id)
+    return query.order_by("-created_at").values_list("deal_id", flat=True).first()

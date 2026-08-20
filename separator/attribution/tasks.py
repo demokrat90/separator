@@ -22,7 +22,13 @@ from separator.bitrix.models import AppInstance
 from separator.bitrix.retry import RETRY_KWARGS
 
 from .bitrix_fields import DEAL_FIELDS, build_deal_fields
-from .models import AUTHOR_RULE_VERSION, ClickToken, DealAttribution, MessageEvent
+from .models import (
+    AUTHOR_RULE_VERSION,
+    ClickToken,
+    DealAttribution,
+    MessageEvent,
+    current_deal_id,
+)
 from .tokens import normalize_phone
 
 logger = logging.getLogger("django")
@@ -428,7 +434,7 @@ def record_outbound(
     app_instance_id=None,
     phone=None,
     chat_ref=None,
-    message_id=None,
+    bitrix_message_id=None,
     text_len=0,
     text_hash=None,
     bitrix_user_id=None,
@@ -436,7 +442,8 @@ def record_outbound(
     line_id=None,
     event_ts=None,
 ):
-    if not message_id or not phone:
+    """Outbound message as Bitrix handed it over, before the send to Graph."""
+    if not bitrix_message_id or not phone:
         return "skipped"
 
     author_type = MessageEvent.AUTHOR_UNKNOWN
@@ -448,11 +455,13 @@ def record_outbound(
         except Exception as exc:  # user.get is a nice-to-have, not a blocker
             logger.warning("attribution: user.get failed for %s: %s", bitrix_user_id, exc)
 
-    MessageEvent.objects.get_or_create(
-        message_id=message_id,
+    # Keyed by the Bitrix id: attach_wamid may have created the row already.
+    # Neither task touches the other's fields, so their order does not matter.
+    MessageEvent.objects.update_or_create(
+        app_instance_id=str(app_instance_id) if app_instance_id else None,
+        bitrix_message_id=str(bitrix_message_id),
         defaults={
             "phone": phone,
-            "app_instance_id": str(app_instance_id) if app_instance_id else None,
             "chat_ref": chat_ref,
             # Bitrix sends `ts` with the event; fall back to receive time.
             "ts": _ts_to_dt(event_ts) or timezone.now(),
@@ -461,6 +470,7 @@ def record_outbound(
             "author_rule_version": AUTHOR_RULE_VERSION,
             "text_len": text_len or 0,
             "text_hash": text_hash,
+            "deal_id": current_deal_id(phone, app_instance_id),
             "raw_meta": {
                 "bitrix_user_id": bitrix_user_id,
                 "bitrix_user_type": user_type,
@@ -470,3 +480,44 @@ def record_outbound(
         },
     )
     return author_type
+
+
+@shared_task(queue="bitrix", **RETRY_KWARGS)
+def attach_wamid(app_instance_id=None, bitrix_message_id=None, wamid=None, phone=None, index=0):
+    """Write the wamid Graph returned onto the outbound row.
+
+    One Bitrix message can produce several sends (one per attachment); every
+    send gets its own row so that each wamid keeps its own delivery statuses.
+    """
+    if not wamid or not bitrix_message_id:
+        return "skipped"
+
+    key = str(bitrix_message_id) if not index else f"{bitrix_message_id}#{index}"
+    app_instance_id = str(app_instance_id) if app_instance_id else None
+    base = None
+    if index:
+        base = MessageEvent.objects.filter(
+            app_instance_id=app_instance_id, bitrix_message_id=str(bitrix_message_id)
+        ).first()
+
+    MessageEvent.objects.update_or_create(
+        app_instance_id=app_instance_id,
+        bitrix_message_id=key,
+        defaults={"message_id": wamid},
+        create_defaults={
+            "message_id": wamid,
+            "bitrix_message_id": key,
+            "app_instance_id": app_instance_id,
+            "phone": (base.phone if base else phone) or phone,
+            "chat_ref": base.chat_ref if base else None,
+            "ts": timezone.now(),
+            "direction": MessageEvent.DIRECTION_OUT,
+            # record_outbound fills this in for the base row; a per-attachment
+            # sibling inherits whatever the base row already knows.
+            "author_type": base.author_type if base else MessageEvent.AUTHOR_UNKNOWN,
+            "author_rule_version": AUTHOR_RULE_VERSION,
+            "deal_id": current_deal_id(phone, app_instance_id) if phone else None,
+            "raw_meta": {"attachment_index": index} if index else {},
+        },
+    )
+    return wamid

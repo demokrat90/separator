@@ -16,7 +16,7 @@ from datetime import timezone as dt_timezone
 
 from django.utils import timezone
 
-from .models import DealAttribution, MessageEvent, StatusEvent
+from .models import DealAttribution, MessageEvent, StatusEvent, current_deal_id
 from .tokens import extract_token, normalize_phone, text_stats
 
 logger = logging.getLogger("django")
@@ -129,6 +129,7 @@ def _record_inbound_message(value, message, app_instance_id, waba_phone_id, task
             "text_len": text_len,
             "text_hash": text_hash,
             "referral": referral,
+            "deal_id": current_deal_id(phone, app_instance_id),
             "raw_meta": {
                 "type": message.get("type"),
                 "waba_phone_id": waba_phone_id,
@@ -186,6 +187,7 @@ def _record_status(item):
             "conversation": conversation,
             "pricing": item.get("pricing") if isinstance(item.get("pricing"), dict) else None,
             "errors": item.get("errors"),
+            "raw": item,
         },
     )
     return "recorded"
@@ -213,8 +215,9 @@ def handle_outbound_bitrix_message(
             app_instance_id=app_instance_id,
             phone=normalize_phone(chat),
             chat_ref=str(chat_id) if chat_id else None,
-            # Bitrix message ids repeat across portals.
-            message_id=f"b24:{app_instance_id}:{message_id}",
+            # The wamid is only known after Graph answers; until then the row is
+            # keyed by the Bitrix message id (see handle_outbound_sent).
+            bitrix_message_id=str(message_id),
             text_len=text_len,
             text_hash=text_hash,
             bitrix_user_id=str(bitrix_user_id) if bitrix_user_id not in (None, "") else None,
@@ -225,4 +228,41 @@ def handle_outbound_bitrix_message(
         return "queued"
     except Exception as exc:
         logger.warning("attribution: outbound hook failed: %s", exc)
+        return "failed"
+
+
+def wamid_from_send_result(send_result):
+    """`messages[0].id` of a Cloud API send response, or None on an error reply."""
+    if not isinstance(send_result, dict):
+        return None
+    messages = send_result.get("messages")
+    if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+        return messages[0].get("id")
+    return None
+
+
+def handle_outbound_sent(
+    app_instance_id=None, bitrix_message_id=None, chat=None, send_result=None, index=0
+):
+    """Graph accepted the outbound message: attach its wamid to our row.
+
+    Without this the delivery statuses (which are keyed by wamid) have nothing
+    to join to on the outbound side.
+    """
+    try:
+        from . import tasks
+
+        wamid = wamid_from_send_result(send_result)
+        if not wamid or not bitrix_message_id:
+            return "no wamid"
+        tasks.attach_wamid.delay(
+            app_instance_id=str(app_instance_id) if app_instance_id else None,
+            bitrix_message_id=str(bitrix_message_id),
+            wamid=wamid,
+            phone=normalize_phone(chat),
+            index=index,
+        )
+        return "queued"
+    except Exception as exc:
+        logger.warning("attribution: wamid hook failed: %s", exc)
         return "failed"

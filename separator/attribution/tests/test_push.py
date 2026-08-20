@@ -326,7 +326,7 @@ def test_outbound_event_records_the_author_rule_version(monkeypatch, app_instanc
     tasks.record_outbound(
         app_instance_id=str(app_instance.id),
         phone=PHONE,
-        message_id=f"b24:{app_instance.id}:42",
+        bitrix_message_id="42",
         bitrix_user_id="9",
     )
     event = MessageEvent.objects.get(direction=MessageEvent.DIRECTION_OUT)

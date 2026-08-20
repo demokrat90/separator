@@ -127,6 +127,8 @@ def test_status_event_keeps_conversation_and_pricing(queued):
     assert int(status.conversation_expiration_at.timestamp()) == 1755686500
     assert status.pricing["pricing_model"] == "CBP"
     assert int(status.ts.timestamp()) == 1755600100
+    # The whole payload is kept, parsed columns are only a convenience.
+    assert status.raw == value["statuses"][0]
 
 
 def test_repeated_status_payload_is_deduplicated(queued):

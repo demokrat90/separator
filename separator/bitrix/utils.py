@@ -1619,7 +1619,9 @@ def event_processor(self, data):
                 # Если есть файлы, отправляем сообщение с каждым файлом отдельно
                 if files:
                     media_caption = text.strip() if text else ""
-                    for file in files:
+                    # file_index keeps one attribution row per send: a Bitrix
+                    # message with N attachments becomes N wamids.
+                    for file_index, file in enumerate(files):
                         uploaded_id = None
                         waba_file_type = _get_waba_file_type(file)
                         try:
@@ -1697,11 +1699,26 @@ def event_processor(self, data):
                                 message["document"]["caption"] = media_caption
 
                         send_result = waba.send_message_from_phone(phone, message)
+                        # Attach the wamid Graph returned: delivery statuses are
+                        # keyed by it, the Bitrix id is not.
+                        attribution_hooks.handle_outbound_sent(
+                            app_instance_id=str(appinstance.id),
+                            bitrix_message_id=message_id,
+                            chat=chat,
+                            send_result=send_result,
+                            index=file_index,
+                        )
                         if handle_waba_send_error(self, send_result, appinstance.id, chat, connector.code, line_id):
                             return send_result
 
                 else:
                     send_result = waba.send_message_from_phone(phone, message)
+                    attribution_hooks.handle_outbound_sent(
+                        app_instance_id=str(appinstance.id),
+                        bitrix_message_id=message_id,
+                        chat=chat,
+                        send_result=send_result,
+                    )
                     if handle_waba_send_error(self, send_result, appinstance.id, chat, connector.code, line_id):
                         return send_result
 
