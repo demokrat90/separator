@@ -62,12 +62,13 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-separator}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-separator}
     # Read-only analytics access (role vasya_ro, SELECT on attribution_* only).
-    # Deliberately left closed: publishing 5433 exposes Postgres to the whole
-    # internet, so open it only together with a ufw rule for one source IP
-    # (`ufw allow from <IP> to any port 5433 proto tcp`). An ssh tunnel
-    # (`ssh -L 5433:localhost:5432 root@187.127.103.222`) needs no port at all.
-    # ports:
-    #   - "5433:5432"
+    # Published on LOOPBACK ONLY - never on 0.0.0.0 (that would expose Postgres
+    # to the whole internet; ufw is inactive on this host, so the bind address
+    # is the only guard). Reached from outside through an ssh tunnel with the
+    # restricted user vasya-tunnel:
+    #   ssh -N -L 5433:127.0.0.1:5433 vasya-tunnel@187.127.103.222
+    ports:
+      - "127.0.0.1:5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-separator} -d ${POSTGRES_DB:-separator}"]
       interval: 10s
