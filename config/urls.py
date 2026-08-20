@@ -66,6 +66,7 @@ urlpatterns += [
         partner_graph_proxy,
         name="waba-partner-graph-object-proxy",
     ),
+    path("api/attr/", include("separator.attribution.urls")),
     path("api/", include("config.api_router")),
     # DRF auth token
     path("api/auth-token/", obtain_auth_token),

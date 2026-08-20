@@ -33,6 +33,7 @@ from .retry import RETRY_KWARGS, TRANSIENT_ERRORS
 
 import separator.bitrix.tasks as bitrix_tasks
 import separator.bitbot.router as bitbot_router
+from separator.attribution import hooks as attribution_hooks
 
 if settings.ASTERX_SERVER:
     from separator.asterx.models import Server
@@ -1561,6 +1562,19 @@ def event_processor(self, data):
                     error_result = {"error": True, "message": "WABA phone not found for Bitrix line"}
                     send_waba_error_to_openline(appinstance.id, chat, error_result, connector.code, line_id)
                     return error_result["message"]
+
+                # Attribution bookkeeping (own tables only, never raises here).
+                attribution_hooks.handle_outbound_bitrix_message(
+                    app_instance_id=str(appinstance.id),
+                    connector_code=connector_code,
+                    line_id=line_id,
+                    chat=chat,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    bitrix_user_id=user_id,
+                    event_ts=data.get("ts"),
+                )
 
                 if not files and command_text in ["#wa_block", "#wa_unblock"]:
                     try:

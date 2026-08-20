@@ -24,6 +24,10 @@ WABA_EVENTS_SEPARATOR = env.bool("WABA_EVENTS_SEPARATOR", default=False)
 WABA_SEND_BITRIX_MESSAGES_ASYNC = env.bool("WABA_SEND_BITRIX_MESSAGES_ASYNC", default=False)
 WABA_SEND_MEDIA_CAPTION_SEPARATELY = env.bool("WABA_SEND_MEDIA_CAPTION_SEPARATELY", default=False)
 
+# WhatsApp lead attribution: static key the sites send in the X-Attr-Key header.
+# Empty key = the /api/attr/ endpoints reject everything (fail closed).
+ATTR_API_KEY = env("ATTR_API_KEY", default="")
+
 BITRIX_OAUTH_URL = env("BITRIX_OAUTH_URL", default="https://oauth.bitrix24.tech")
 BITRIX_TEMP_FILE_BASE_URL = env("BITRIX_TEMP_FILE_BASE_URL", default="")
 OPENAI_API_BASE_URL = env("OPENAI_API_BASE_URL", default="https://api.openai.com")
@@ -123,7 +127,8 @@ LOCAL_APPS = [
     "separator.waweb",
     "separator.asterx",
     "separator.voip",
-    "separator.bitbot"
+    "separator.bitbot",
+    "separator.attribution",
 ]
 
 # Asterisk Connector AsterX

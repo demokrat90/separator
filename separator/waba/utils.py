@@ -25,6 +25,7 @@ import separator.bitrix.utils as bitrix_utils
 
 from separator.waba.bot import bot_processor
 from separator.waba.retry import RETRY_KWARGS, TRANSIENT_ERRORS
+from separator.attribution import hooks as attribution_hooks
 
 from .models import (
     App,
@@ -1657,6 +1658,15 @@ def event_processing(raw_body=None, signature=None, app_id=None, host=None):
             raise
     
     elif field == 'messages':
+        # Attribution bookkeeping (own tables only, never raises into this flow).
+        # Runs before the guards below so events are recorded even when the phone
+        # is temporarily not linked to a Bitrix line.
+        attribution_hooks.handle_inbound_value(
+            value,
+            app_instance_id=str(appinstance.id) if appinstance else None,
+            waba_phone_id=phone.phone_id if phone else None,
+        )
+
         if not appinstance or not phone.line_id or not phone.line.connector_id:
             return "WABA phone is not connected to Bitrix line"
 
