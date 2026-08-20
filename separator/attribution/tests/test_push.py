@@ -1,5 +1,7 @@
 """push_deal_attribution(): deal lookup, field payload, error tolerance."""
 
+from datetime import timedelta
+
 import pytest
 from django.utils import timezone
 
@@ -35,6 +37,7 @@ def attribution():
     return DealAttribution.objects.create(
         phone=PHONE,
         first_inbound_at=timezone.now(),
+        app_instance_id="app-1",
         attribution_source=DealAttribution.SOURCE_SITE,
         attribution_status=DealAttribution.STATUS_MATCHED,
         token=token,
@@ -172,3 +175,99 @@ def test_missing_deal_retries(monkeypatch, app_instance, attribution):
     assert retries and retries[0]["countdown"] == 30
     attribution.refresh_from_db()
     assert attribution.deal_id is None
+
+
+def test_newest_deal_across_all_contacts_wins(monkeypatch, app_instance, attribution):
+    calls = []
+    now = timezone.now()
+
+    def deal_list(data):
+        contact = data["filter"]["CONTACT_ID"]
+        if contact == 9014:
+            return {"result": [{"ID": "500", "DATE_CREATE": (now - timedelta(minutes=5)).isoformat()}]}
+        return {"result": [{"ID": "617", "DATE_CREATE": now.isoformat()}]}
+
+    monkeypatch.setattr(
+        tasks,
+        "call_method",
+        fake_bitrix(
+            {
+                "crm.duplicate.findbycomm": {"result": {"CONTACT": [9014, 9015]}},
+                "crm.deal.list": deal_list,
+                "imopenlines.crm.chat.getLastId": {"result": None},
+                "crm.deal.fields": {"result": ALL_FIELDS},
+                "crm.deal.update": {"result": True},
+            },
+            calls,
+        ),
+    )
+
+    tasks.push_deal_attribution(attribution.id, str(app_instance.id))
+    attribution.refresh_from_db()
+    assert attribution.deal_id == "617"
+
+
+def test_deal_older_than_the_conversation_is_never_written(monkeypatch, app_instance, attribution):
+    """A pre-existing deal belongs to somebody else - wait, then give up."""
+    calls = []
+    stale = (timezone.now() - timedelta(days=5)).isoformat()
+    monkeypatch.setattr(
+        tasks,
+        "call_method",
+        fake_bitrix(
+            {
+                "crm.duplicate.findbycomm": {"result": {"CONTACT": [9014]}},
+                "crm.deal.list": {"result": [{"ID": "42", "DATE_CREATE": stale}]},
+            },
+            calls,
+        ),
+    )
+    retries = []
+    monkeypatch.setattr(
+        tasks.push_deal_attribution,
+        "retry",
+        lambda **kw: retries.append(kw) or RuntimeError("retry"),
+    )
+
+    with pytest.raises(RuntimeError):
+        tasks.push_deal_attribution(attribution.id, str(app_instance.id))
+
+    assert retries
+    assert "crm.deal.update" not in dict(calls)
+    attribution.refresh_from_db()
+    assert attribution.deal_id is None
+
+
+def test_sweeper_requeues_lost_work(monkeypatch, app_instance):
+    from separator.attribution.models import MessageEvent
+
+    resolved, pushed = [], []
+    monkeypatch.setattr(tasks.resolve, "delay", lambda *a, **kw: resolved.append((a, kw)))
+    monkeypatch.setattr(tasks.push_deal_attribution, "delay", lambda *a: pushed.append(a))
+
+    event = MessageEvent.objects.create(
+        phone=PHONE,
+        app_instance_id=str(app_instance.id),
+        direction=MessageEvent.DIRECTION_IN,
+        author_type=MessageEvent.AUTHOR_CUSTOMER,
+        message_id="wamid.LOST",
+        raw_meta={"click_code": "K7QX9M", "resolve_pending": True},
+    )
+    stuck = DealAttribution.objects.create(
+        phone=PHONE,
+        app_instance_id=str(app_instance.id),
+        attribution_source=DealAttribution.SOURCE_NONE,
+        attribution_status=DealAttribution.STATUS_CODE_MISSING,
+    )
+    old = timezone.now() - timedelta(hours=1)
+    MessageEvent.objects.filter(pk=event.pk).update(created_at=old)
+    DealAttribution.objects.filter(pk=stuck.pk).update(created_at=old)
+
+    assert tasks.sweep_pending_attributions() == {"resolve": 1, "push": 1}
+    assert resolved[0][0][2] == "K7QX9M"
+    assert pushed == [(stuck.id, str(app_instance.id))]
+
+    # Already swept: a second run must not queue the resolve again.
+    resolved.clear()
+    tasks.sweep_pending_attributions()
+    assert resolved == []

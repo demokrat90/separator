@@ -105,3 +105,46 @@ def test_click_is_rate_limited_per_ip(client, settings):
         )
     assert codes == {201, 429}
     cache.clear()
+
+
+def test_click_truncates_long_values_and_parses_booleans(client, settings):
+    settings.ATTR_API_KEY = KEY
+    response = client.post(
+        reverse("attribution:click"),
+        data={
+            "site": "x" * 500,
+            "gclid": "g" * 900,
+            "landing_url": "https://photon.estate/" + "a" * 5000,
+            "is_test": "false",
+        },
+        content_type="application/json",
+        headers={"x-attr-key": KEY},
+    )
+    assert response.status_code == 201
+
+    token = ClickToken.objects.get(token=response.json()["token"])
+    assert len(token.site) == 64
+    assert len(token.gclid) == 512
+    assert len(token.landing_url) > 512  # TextField: kept whole
+    assert token.is_test is False
+
+
+def test_rate_limit_counts_the_proxy_seen_ip_not_the_forged_one(client, settings):
+    settings.ATTR_API_KEY = KEY
+    from django.core.cache import cache
+
+    cache.clear()
+    url = reverse("attribution:click")
+    codes = set()
+    for i in range(62):
+        codes.add(
+            client.post(
+                url,
+                data={},
+                content_type="application/json",
+                headers={"x-attr-key": KEY, "x-forwarded-for": f"1.2.3.{i}, 10.0.0.9"},
+            ).status_code
+        )
+    # The spoofed first entry changes every time; the limit still bites.
+    assert 429 in codes
+    cache.clear()

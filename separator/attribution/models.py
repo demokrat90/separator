@@ -74,12 +74,16 @@ class MessageEvent(models.Model):
     ]
 
     phone = models.CharField(max_length=32, db_index=True)
+    # Bitrix AppInstance this message belongs to: ids handed out by Bitrix are
+    # unique per portal only, so every uniqueness rule is scoped by it.
+    app_instance_id = models.CharField(max_length=64, null=True, blank=True, db_index=True)
     chat_ref = models.CharField(max_length=64, null=True, blank=True, db_index=True)
     # Time reported by Meta / Bitrix in the payload, NOT the time we received it.
     ts = models.DateTimeField(null=True, blank=True, db_index=True)
     direction = models.CharField(max_length=8, choices=DIRECTION_CHOICES)
     author_type = models.CharField(max_length=16, choices=AUTHOR_CHOICES)
-    # wamid for WhatsApp messages, Bitrix message id for outbound connector events.
+    # wamid (globally unique) for WhatsApp messages; for outbound connector
+    # events `b24:<app_instance>:<bitrix message id>`.
     message_id = models.CharField(max_length=255, unique=True)
     # id of the message this one replies to (WhatsApp `context.id`).
     reply_to_id = models.CharField(max_length=255, null=True, blank=True)
@@ -151,6 +155,8 @@ class DealAttribution(models.Model):
 
     deal_id = models.CharField(max_length=32, null=True, blank=True, db_index=True)
     phone = models.CharField(max_length=32, db_index=True)
+    # Deal ids are unique per portal only - see MessageEvent.app_instance_id.
+    app_instance_id = models.CharField(max_length=64, null=True, blank=True, db_index=True)
     chat_ref = models.CharField(max_length=64, null=True, blank=True)
     first_inbound_at = models.DateTimeField(null=True, blank=True, db_index=True)
     attribution_source = models.CharField(max_length=32, choices=SOURCE_CHOICES)
@@ -172,7 +178,7 @@ class DealAttribution(models.Model):
         ordering = ("-created_at",)
         constraints = [
             models.UniqueConstraint(
-                fields=["deal_id"],
+                fields=["app_instance_id", "deal_id"],
                 condition=models.Q(deal_id__isnull=False),
                 name="attribution_deal_unique",
             )

@@ -1614,6 +1614,17 @@ def event_processing(raw_body=None, signature=None, app_id=None, host=None):
         except Exception:
             raise
         
+    # Attribution bookkeeping (own tables only, never raises into this flow).
+    # Placed before the bot/normal split so that bot-enabled numbers - which
+    # never reach the `messages` branch below - are still accounted for, and
+    # before the line/subscription guards so events survive a broken link.
+    if field == 'messages':
+        attribution_hooks.handle_inbound_value(
+            value,
+            app_instance_id=str(appinstance.id) if appinstance else None,
+            waba_phone_id=phone.phone_id if phone else None,
+        )
+
     # ctwa bot
     bot = Bot.objects.filter(phone=phone).first()
     if bot and field == 'messages':
@@ -1658,15 +1669,6 @@ def event_processing(raw_body=None, signature=None, app_id=None, host=None):
             raise
     
     elif field == 'messages':
-        # Attribution bookkeeping (own tables only, never raises into this flow).
-        # Runs before the guards below so events are recorded even when the phone
-        # is temporarily not linked to a Bitrix line.
-        attribution_hooks.handle_inbound_value(
-            value,
-            app_instance_id=str(appinstance.id) if appinstance else None,
-            waba_phone_id=phone.phone_id if phone else None,
-        )
-
         if not appinstance or not phone.line_id or not phone.line.connector_id:
             return "WABA phone is not connected to Bitrix line"
 

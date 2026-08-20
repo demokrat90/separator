@@ -48,9 +48,17 @@ STRING_FIELDS = (
 
 
 def _client_ip(request):
+    """IP for rate limiting.
+
+    Behind exactly one reverse proxy (Caddy) the trustworthy entry of
+    X-Forwarded-For is the LAST one - the address the proxy itself saw. The
+    first entry is client supplied and can be forged to dodge the limit.
+    """
     forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
     if forwarded:
-        return forwarded.split(",")[0].strip()
+        parts = [part.strip() for part in forwarded.split(",") if part.strip()]
+        if parts:
+            return parts[-1]
     return request.META.get("REMOTE_ADDR", "")
 
 
@@ -88,6 +96,37 @@ def health(request):
     return Response({"status": "ok", "schema_version": SCHEMA_VERSION})
 
 
+MAX_BODY_BYTES = 32 * 1024
+FALSE_VALUES = {"0", "false", "no", "off", ""}
+
+_MAX_LENGTHS = {
+    field.name: field.max_length
+    for field in ClickToken._meta.get_fields()
+    if getattr(field, "max_length", None)
+}
+
+
+def _clean(value, field):
+    """One scalar field: text only, trimmed to what the column can hold."""
+    if value is None or isinstance(value, (dict, list)):
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    limit = _MAX_LENGTHS.get(field)
+    return value[:limit] if limit else value
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() not in FALSE_VALUES
+
+
 @api_view(["POST"])
 @authentication_classes([])
 @permission_classes([AllowAny])
@@ -96,12 +135,22 @@ def click(request):
         return Response({"detail": "forbidden"}, status=status.HTTP_403_FORBIDDEN)
     if _rate_limited(request):
         return Response({"detail": "rate limited"}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+    try:
+        if int(request.META.get("CONTENT_LENGTH") or 0) > MAX_BODY_BYTES:
+            return Response(
+                {"detail": "payload too large"},
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+    except (TypeError, ValueError):
+        pass
 
     payload = request.data if isinstance(request.data, dict) else {}
 
-    values = {field: (payload.get(field) or None) for field in STRING_FIELDS}
-    values["ga_client_id"] = normalize_ga_client_id(payload.get("ga_client_id")) or None
-    values["is_test"] = bool(payload.get("is_test", False))
+    values = {field: _clean(payload.get(field), field) for field in STRING_FIELDS}
+    values["ga_client_id"] = _clean(
+        normalize_ga_client_id(payload.get("ga_client_id")), "ga_client_id"
+    )
+    values["is_test"] = _as_bool(payload.get("is_test", False))
     values["raw"] = payload
     values["schema_version"] = SCHEMA_VERSION
 
@@ -119,8 +168,8 @@ def click(request):
 
     # `listing` (a human readable title) is optional; listing_id is the fallback,
     # and `brand` lets a non-Photon site greet with its own name.
-    listing = payload.get("listing") or token.listing_id
-    brand = payload.get("brand") or "Photon"
+    listing = _clean(payload.get("listing"), "listing_id") or token.listing_id
+    brand = _clean(payload.get("brand"), "site") or "Photon"
     return Response(
         {
             "token": token.token,

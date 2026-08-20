@@ -48,6 +48,11 @@ def test_inbound_message_is_recorded_without_text(queued):
     assert event.reply_to_id == "wamid.PREVIOUS"
     assert event.text_len == len("Hello! #K7QX9M")
     assert event.text_hash and "K7QX9M" not in event.text_hash
+    # The code is extracted here; the message text never becomes a task argument.
+    assert event.raw_meta["click_code"] == "K7QX9M"
+    args, kwargs = queued[0]
+    assert args[2] == "K7QX9M"
+    assert "Hello! #K7QX9M" not in [str(a) for a in args]
     # ts is Meta's timestamp, not the moment we processed the webhook.
     assert int(event.ts.timestamp()) == 1755600000
     assert len(queued) == 1
@@ -70,10 +75,11 @@ def test_referral_is_stored_whole(queued):
 def test_second_message_within_30_days_does_not_start_a_new_attribution(queued):
     DealAttribution.objects.create(
         phone="+971521892809",
+        app_instance_id="app-1",
         attribution_source=DealAttribution.SOURCE_NONE,
         attribution_status=DealAttribution.STATUS_CODE_MISSING,
     )
-    hooks.handle_inbound_value(inbound_value())
+    hooks.handle_inbound_value(inbound_value(), app_instance_id="app-1")
     assert MessageEvent.objects.count() == 1
     assert queued == []
 
@@ -81,11 +87,12 @@ def test_second_message_within_30_days_does_not_start_a_new_attribution(queued):
 def test_attribution_restarts_after_the_30_day_window(queued):
     DealAttribution.objects.create(
         phone="+971521892809",
+        app_instance_id="app-1",
         attribution_source=DealAttribution.SOURCE_NONE,
         attribution_status=DealAttribution.STATUS_CODE_MISSING,
     )
     DealAttribution.objects.update(created_at=timezone.now() - timedelta(days=31))
-    hooks.handle_inbound_value(inbound_value())
+    hooks.handle_inbound_value(inbound_value(), app_instance_id="app-1")
     assert len(queued) == 1
 
 

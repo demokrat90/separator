@@ -3,6 +3,11 @@
 Hard rule for everything here: attribution must never break message delivery.
 Every public function swallows its own exceptions and returns a short status
 string for the log; callers are not expected to check it.
+
+Message text never leaves this module: the click code is extracted here, and
+only the code, the length and the sha256 hash travel further (a Celery argument
+is persisted in the broker and in the result metadata, so passing the text
+itself would store it).
 """
 
 import logging
@@ -12,7 +17,7 @@ from datetime import timezone as dt_timezone
 from django.utils import timezone
 
 from .models import DealAttribution, MessageEvent, StatusEvent
-from .tokens import normalize_phone, text_stats
+from .tokens import extract_token, normalize_phone, text_stats
 
 logger = logging.getLogger("django")
 
@@ -32,7 +37,7 @@ def _dt(value):
 
 
 def message_text(message):
-    """Best-effort text of an inbound message (used for hash + token search)."""
+    """Best-effort text of an inbound message (used for hash + code search)."""
     if not isinstance(message, dict):
         return None
     mtype = message.get("type")
@@ -64,9 +69,12 @@ def _customer_phone(value, message):
     return normalize_phone(wa_id or message.get("from"))
 
 
-def _should_start_attribution(phone):
+def _should_start_attribution(phone, app_instance_id):
     since = timezone.now() - timedelta(days=FIRST_INBOUND_WINDOW_DAYS)
-    return not DealAttribution.objects.filter(phone=phone, created_at__gte=since).exists()
+    existing = DealAttribution.objects.filter(phone=phone, created_at__gte=since)
+    if app_instance_id:
+        existing = existing.filter(app_instance_id=app_instance_id)
+    return not existing.exists()
 
 
 def handle_inbound_value(value, app_instance_id=None, waba_phone_id=None):
@@ -104,13 +112,16 @@ def _record_inbound_message(value, message, app_instance_id, waba_phone_id, task
 
     text = message_text(message)
     text_len, text_hash = text_stats(text)
+    code = extract_token(text)
     referral = message.get("referral") if isinstance(message.get("referral"), dict) else None
     ts = _dt(message.get("timestamp"))
+    start_attribution = _should_start_attribution(phone, app_instance_id)
 
-    _event, created = MessageEvent.objects.get_or_create(
+    event, created = MessageEvent.objects.get_or_create(
         message_id=message_id,
         defaults={
             "phone": phone,
+            "app_instance_id": app_instance_id,
             "ts": ts,
             "direction": MessageEvent.DIRECTION_IN,
             "author_type": MessageEvent.AUTHOR_CUSTOMER,
@@ -118,23 +129,39 @@ def _record_inbound_message(value, message, app_instance_id, waba_phone_id, task
             "text_len": text_len,
             "text_hash": text_hash,
             "referral": referral,
-            "raw_meta": {"type": message.get("type"), "waba_phone_id": waba_phone_id},
+            "raw_meta": {
+                "type": message.get("type"),
+                "waba_phone_id": waba_phone_id,
+                # Our own code, not customer text: keeps resolve() replayable
+                # from the database if the queue call below is lost.
+                "click_code": code,
+                "resolve_pending": start_attribution,
+            },
         },
     )
     if not created:
         # Duplicate wamid: Meta re-delivery or a Celery retry of event_processing.
         return "duplicate"
 
-    if not _should_start_attribution(phone):
+    if not start_attribution:
         return "recorded"
 
-    tasks.resolve.delay(
-        phone,
-        message_id,
-        text,
-        referral,
-        message.get("timestamp"),
-        app_instance_id=app_instance_id,
+    try:
+        tasks.resolve.delay(
+            phone,
+            message_id,
+            code,
+            referral,
+            message.get("timestamp"),
+            app_instance_id=app_instance_id,
+        )
+    except Exception as exc:
+        # The event row keeps resolve_pending=True; the sweeper picks it up.
+        logger.error("attribution: could not queue resolve for %s: %s", message_id, exc)
+        return "resolve not queued"
+
+    MessageEvent.objects.filter(pk=event.pk).update(
+        raw_meta={**(event.raw_meta or {}), "resolve_pending": False}
     )
     return "resolve queued"
 
@@ -186,7 +213,8 @@ def handle_outbound_bitrix_message(
             app_instance_id=app_instance_id,
             phone=normalize_phone(chat),
             chat_ref=str(chat_id) if chat_id else None,
-            message_id=f"b24:{message_id}",
+            # Bitrix message ids repeat across portals.
+            message_id=f"b24:{app_instance_id}:{message_id}",
             text_len=text_len,
             text_hash=text_hash,
             bitrix_user_id=str(bitrix_user_id) if bitrix_user_id not in (None, "") else None,
