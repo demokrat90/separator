@@ -183,3 +183,28 @@ def test_oversized_payload_is_rejected_and_raw_is_bounded(client, settings):
     )
     assert big.status_code == 413
     assert ClickToken.objects.count() == 0
+
+
+def test_raw_is_never_null_whatever_the_creation_path(client, settings):
+    """`raw` NULL used to mean "created outside the API" - now it cannot happen."""
+    settings.ATTR_API_KEY = KEY
+
+    # 1. API path: raw is the payload the site sent.
+    api = client.post(
+        reverse("attribution:click"),
+        data=PAYLOAD,
+        content_type="application/json",
+        headers={"x-attr-key": KEY},
+    )
+    from_api = ClickToken.objects.get(token=api.json()["token"])
+    assert from_api.raw["landing_url"] == PAYLOAD["landing_url"]
+
+    # 2. Shell / admin path: no input at all, but the row still documents itself.
+    from_shell = ClickToken.objects.create(token="SHELL1", site="photon", gclid="G-1")
+    assert from_shell.raw == {"site": "photon", "gclid": "G-1", "is_test": False}
+
+    # 3. Nothing but a token: an empty dict, never NULL.
+    bare = ClickToken.objects.create(token="BARE01")
+    assert bare.raw == {"is_test": False}
+
+    assert ClickToken.objects.filter(raw__isnull=True).count() == 0

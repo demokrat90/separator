@@ -10,6 +10,10 @@ from django.db import models
 
 SCHEMA_VERSION = 1
 
+# Version of the rule that decides bot vs human_agent on outbound messages.
+# Bump it whenever that logic changes (see attribution.tasks._author_type).
+AUTHOR_RULE_VERSION = "usertype-v1"
+
 
 class ClickToken(models.Model):
     """A code handed out to a site visitor before they open WhatsApp.
@@ -45,7 +49,10 @@ class ClickToken(models.Model):
     ym_client_id = models.CharField(max_length=128, null=True, blank=True)
 
     is_test = models.BooleanField(default=False)
-    raw = models.JSONField(null=True, blank=True)
+    # Never NULL: an analyst must be able to tell "the site sent nothing" from
+    # "someone created the row bypassing the API". Rows made outside the API
+    # (admin, shell) get their own field values written here on insert.
+    raw = models.JSONField(default=dict, blank=True)
     schema_version = models.PositiveIntegerField(default=SCHEMA_VERSION)
 
     class Meta:
@@ -53,6 +60,23 @@ class ClickToken(models.Model):
 
     def __str__(self):
         return self.token
+
+    def save(self, *args, **kwargs):
+        if self._state.adding and not self.raw:
+            self.raw = self.as_input_dict()
+        super().save(*args, **kwargs)
+
+    def as_input_dict(self):
+        """The token's own input fields as a dict - `{}` when there was no input."""
+        return {
+            field.name: getattr(self, field.name)
+            for field in self._meta.concrete_fields
+            if field.name not in INTERNAL_FIELDS and getattr(self, field.name) not in (None, "")
+        }
+
+
+# Bookkeeping columns: not part of what a site "sent in".
+INTERNAL_FIELDS = {"id", "raw", "created_at", "claimed_at", "phone", "token", "schema_version"}
 
 
 class MessageEvent(models.Model):
@@ -82,6 +106,9 @@ class MessageEvent(models.Model):
     ts = models.DateTimeField(null=True, blank=True, db_index=True)
     direction = models.CharField(max_length=8, choices=DIRECTION_CHOICES)
     author_type = models.CharField(max_length=16, choices=AUTHOR_CHOICES)
+    # Which rule decided author_type, so rows written before the bot/human rule
+    # was verified in the field stay distinguishable from rows written after.
+    author_rule_version = models.CharField(max_length=32, default=AUTHOR_RULE_VERSION)
     # wamid (globally unique) for WhatsApp messages; for outbound connector
     # events `b24:<app_instance>:<bitrix message id>`.
     message_id = models.CharField(max_length=255, unique=True)

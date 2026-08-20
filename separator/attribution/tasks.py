@@ -22,7 +22,7 @@ from separator.bitrix.models import AppInstance
 from separator.bitrix.retry import RETRY_KWARGS
 
 from .bitrix_fields import DEAL_FIELDS, build_deal_fields
-from .models import ClickToken, DealAttribution, MessageEvent
+from .models import AUTHOR_RULE_VERSION, ClickToken, DealAttribution, MessageEvent
 from .tokens import normalize_phone
 
 logger = logging.getLogger("django")
@@ -458,6 +458,7 @@ def record_outbound(
             "ts": _ts_to_dt(event_ts) or timezone.now(),
             "direction": MessageEvent.DIRECTION_OUT,
             "author_type": author_type,
+            "author_rule_version": AUTHOR_RULE_VERSION,
             "text_len": text_len or 0,
             "text_hash": text_hash,
             "raw_meta": {

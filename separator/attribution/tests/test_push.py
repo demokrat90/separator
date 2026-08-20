@@ -315,3 +315,20 @@ def test_push_marks_terminal_state(monkeypatch, app_instance, attribution):
     tasks.push_deal_attribution(attribution.id, str(app_instance.id))
     attribution.refresh_from_db()
     assert attribution.push_state == DealAttribution.PUSH_DONE
+
+
+def test_outbound_event_records_the_author_rule_version(monkeypatch, app_instance):
+    from separator.attribution.models import AUTHOR_RULE_VERSION, MessageEvent
+
+    monkeypatch.setattr(
+        tasks, "call_method", fake_bitrix({"user.get": {"result": [{"USER_TYPE": "employee"}]}}, [])
+    )
+    tasks.record_outbound(
+        app_instance_id=str(app_instance.id),
+        phone=PHONE,
+        message_id=f"b24:{app_instance.id}:42",
+        bitrix_user_id="9",
+    )
+    event = MessageEvent.objects.get(direction=MessageEvent.DIRECTION_OUT)
+    assert event.author_type == MessageEvent.AUTHOR_HUMAN
+    assert event.author_rule_version == AUTHOR_RULE_VERSION == "usertype-v1"
