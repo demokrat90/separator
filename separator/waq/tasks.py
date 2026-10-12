@@ -15,7 +15,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from . import alerts, classify, localtime
+from . import alerts, classify, hooks, localtime
 from .gate import KIND_CONFIRMATION, KIND_REMINDER, gate, post_message
 from .models import WaqEvent, WaqLead, WaqPhone, WaqSettings
 
@@ -61,6 +61,12 @@ CLOSING_STATES = (WaqLead.STATE_QUALIFIED, WaqLead.STATE_NOT_LEAD, WaqLead.STATE
 
 
 @shared_task(queue=QUEUE, acks_late=False, ignore_result=True)
+def deliver_alert(text):
+    """Telegram alert queued from the webhook path (hooks.queue_alert)."""
+    return alerts.send_alert(text)
+
+
+@shared_task(queue=QUEUE, acks_late=False, ignore_result=True)
 def send_confirmation(lead_id):
     result = gate(lead_id, KIND_CONFIRMATION)
     return result.status
@@ -84,7 +90,7 @@ def run_schedule():
         WaqLead.awaiting_reply_q(),
         Q(confirmation_attempted_at__lte=answer_deadline) | Q(confirmation_sent_at__lte=answer_deadline),
         replied_at__isnull=True,
-    ).update(state=WaqLead.STATE_NO_ANSWER)
+    ).update(state=WaqLead.STATE_NO_ANSWER, no_answer_at=now)
 
     if not cfg.reminder_enabled:
         return {"no_answer": expired, "reminders": "disabled"}
@@ -166,9 +172,13 @@ def process_reply(lead_id, message):
     if not message_id:
         return "no message id"
 
+    # Meta's time of the message: a reply sent before the scheduler gave up
+    # (no_answer) is still handled even if it is processed after that.
+    message_at = hooks.message_time(message)
+
     # Cheap pre-check before any paid call; repeated under the lock below.
     lead = WaqLead.objects.filter(pk=lead_id).first()
-    if lead is None or not lead.awaits_reply():
+    if lead is None or not lead.accepts_reply(message_at):
         return "not waiting"
     if _already_processed(lead_id, message_id):
         return "duplicate"
@@ -205,10 +215,20 @@ def process_reply(lead_id, message):
         # (bounded by the Graph timeout); this runs on the waq worker, not on
         # the inbound path.
         lead = WaqLead.objects.select_for_update().filter(pk=lead_id).first()
-        if lead is None or not lead.awaits_reply():
+        if lead is None or not lead.accepts_reply(message_at):
             return "not waiting"
         if _already_processed(lead_id, message_id):
             return "duplicate"
+        if lead.answered_before_no_answer(message_at):
+            # The customer answered in time: reopen the dialogue, then handle
+            # the reply as usual (no_answer -> qualified / not_lead / stopped).
+            lead.state = (
+                WaqLead.STATE_REMINDER_SENT if lead.reminder_sent_at else
+                WaqLead.STATE_CONFIRMATION_SENT if lead.confirmation_sent_at else
+                WaqLead.STATE_CONFIRMATION_UNKNOWN
+            )
+            lead.no_answer_at = None
+            lead.save(update_fields=["state", "no_answer_at"])
         WaqEvent.objects.create(
             lead=lead,
             kind=WaqEvent.KIND_REPLY,

@@ -750,3 +750,58 @@ def test_closed_leads_ignore_replies_even_with_an_attempt(bot, state):
 def test_received_lead_without_an_attempt_is_not_waiting(bot):
     lead = make_lead()
     assert tasks.process_reply(lead.id, button("waq:yes")) == "not waiting"
+
+
+# ------------------------------------------- reply queued before no_answer (race)
+
+
+def _ts(moment):
+    return str(int(moment.timestamp()))
+
+
+def _no_answer_lead(cut_off, **overrides):
+    values = {
+        "state": WaqLead.STATE_CONFIRMATION_SENT,
+        "confirmation_attempted_at": timezone.now() - timedelta(hours=25),
+        "confirmation_sent_at": timezone.now() - timedelta(hours=25),
+    }
+    values.update(overrides)
+    lead = make_lead(**values)
+    # The scheduler runs between the hook queuing the reply and its processing.
+    tasks.run_schedule()
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_NO_ANSWER and lead.no_answer_at is not None
+    return lead
+
+
+def test_reply_sent_before_no_answer_still_qualifies(bot):
+    sent = timezone.now() - timedelta(minutes=1)
+    lead = _no_answer_lead(sent)
+    message = {**button("waq:yes"), "timestamp": _ts(sent)}
+    assert tasks.process_reply(lead.id, message) == "qualified"
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_QUALIFIED
+    assert lead.no_answer_at is None
+    assert sent_texts(bot.graph) == ["QUAL-TEXT"]
+
+
+def test_stop_sent_before_no_answer_still_opts_out(bot, llm):
+    llm.label = classify.STOP
+    sent = timezone.now() - timedelta(minutes=1)
+    lead = _no_answer_lead(sent)
+    assert tasks.process_reply(lead.id, {**text_message("stop"), "timestamp": _ts(sent)}) == "stopped"
+    assert WaqPhone.objects.get(phone=CUSTOMER).opted_out is True
+
+
+def test_reply_sent_after_no_answer_is_not_handled(bot):
+    lead = _no_answer_lead(timezone.now())
+    later = timezone.now() + timedelta(minutes=1)
+    assert tasks.process_reply(lead.id, {**button("waq:yes"), "timestamp": _ts(later)}) == "not waiting"
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_NO_ANSWER
+    assert bot.graph.calls == []
+
+
+def test_reply_without_a_timestamp_after_no_answer_is_not_handled(bot):
+    lead = _no_answer_lead(timezone.now())
+    assert tasks.process_reply(lead.id, button("waq:yes")) == "not waiting"

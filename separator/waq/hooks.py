@@ -1,8 +1,9 @@
 """Entry points called from the WABA webhook flow (separator/waba/utils.py).
 
 Hard rule: never break and never delay the path to Bitrix. Every function here
-swallows its own exceptions; the inbound hook does at most two indexed queries
-and queues a task without publish retries.
+swallows its own exceptions, does only short database work and queues tasks
+with 1 s broker timeouts and no publish retries. No HTTP call (Telegram, Graph,
+Claude) is ever made from here: alerts are delivered by the waq worker.
 """
 
 import logging
@@ -21,7 +22,7 @@ REPLY_LOOKBACK_DAYS = 7
 PUBLISH_TIMEOUT_SECONDS = 1
 
 
-def publish_reply(task, args):
+def publish(task, args):
     """Queue `task` with short broker timeouts and no publish retries."""
     app = task.app
     with app.connection_for_write(
@@ -33,6 +34,30 @@ def publish_reply(task, args):
         }
     ) as connection:
         task.apply_async(args=args, retry=False, connection=connection)
+
+
+def queue_alert(text):
+    """Alert from the webhook path: queued to the waq worker, never sent here
+    (a slow Telegram must not hold worker-waba). Never raises."""
+    try:
+        from . import tasks
+
+        publish(tasks.deliver_alert, [text])
+        return True
+    except Exception as exc:
+        logger.error("waq: alert could not be queued (%s): %s", type(exc).__name__, text[:300])
+        return False
+
+
+def message_time(message):
+    """Meta's unix `timestamp` of a message as an aware datetime, or None."""
+    try:
+        from datetime import datetime
+        from datetime import timezone as dt_timezone
+
+        return datetime.fromtimestamp(int(message.get("timestamp")), tz=dt_timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError, AttributeError):
+        return None
 
 
 def normalize_phone(value):
@@ -105,9 +130,15 @@ def handle_inbound_value(value, phone=None):
                 # A template was attempted within the window and the dialogue is
                 # not closed (see WaqLead.awaiting_reply_q). A plain SELECT: the
                 # hook never waits on the row lock the gate holds during a POST.
+                sent_at = message_time(message)
+                # Also a lead the scheduler marked no_answer AFTER this message
+                # was sent (a late webhook delivery).
+                late_but_in_time = (
+                    Q(state=WaqLead.STATE_NO_ANSWER, no_answer_at__gt=sent_at) if sent_at else Q(pk__in=[])
+                )
                 lead = (
                     WaqLead.objects.filter(
-                        WaqLead.awaiting_reply_q(),
+                        WaqLead.awaiting_reply_q() | late_but_in_time,
                         Q(confirmation_attempted_at__gte=since)
                         | Q(reminder_attempted_at__gte=since)
                         | Q(confirmation_sent_at__gte=since),
@@ -123,7 +154,7 @@ def handle_inbound_value(value, phone=None):
                 if lead is None:
                     handled.append("not ours")
                     continue
-                publish_reply(tasks.process_reply, [lead.id, slim_message(message)])
+                publish(tasks.process_reply, [lead.id, slim_message(message)])
                 handled.append("queued")
             except Exception as exc:
                 logger.error("waq: inbound message hook failed: %s", exc)
@@ -135,15 +166,14 @@ def handle_inbound_value(value, phone=None):
 
 
 def handle_quality_update(value):
-    """phone_number_quality_update webhook: record + alert. Never raises."""
+    """phone_number_quality_update webhook: record + queue an alert. Never raises."""
     try:
-        from . import alerts
         from .models import WaqEvent
 
         data = value if isinstance(value, dict) else {"raw": str(value)}
         WaqEvent.objects.create(kind=WaqEvent.KIND_QUALITY, data=data)
         parts = [f"{key}={data.get(key)}" for key in sorted(data) if data.get(key) not in (None, "")]
-        alerts.send_alert("phone quality update: " + ", ".join(parts))
+        queue_alert("phone quality update: " + ", ".join(parts))
         return True
     except Exception as exc:
         logger.error("waq: quality update hook failed: %s", exc)
@@ -159,7 +189,7 @@ def waq_template_names():
 
 def handle_template_status(value):
     """message_template_status_update for one of our templates (any status other
-    than APPROVED / PENDING_DELETION): record + alert.
+    than APPROVED / PENDING_DELETION): record + queue an alert.
 
     Returns True if the event was ours and recorded, False otherwise.
     """
@@ -167,11 +197,10 @@ def handle_template_status(value):
         name = (value or {}).get("message_template_name")
         if not name or name not in waq_template_names():
             return False
-        from . import alerts
         from .models import WaqEvent
 
         WaqEvent.objects.create(kind=WaqEvent.KIND_TEMPLATE_STATUS, data=value)
-        alerts.send_alert(
+        queue_alert(
             f"template {name} ({value.get('message_template_language')}): "
             f"{value.get('event')} reason={value.get('reason')}"
         )

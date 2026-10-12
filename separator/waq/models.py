@@ -163,6 +163,9 @@ class WaqLead(models.Model):
     reminder_wamid = models.CharField(max_length=255, blank=True, default="")
     reminder_sent_at = models.DateTimeField(null=True, blank=True, db_index=True)
     replied_at = models.DateTimeField(null=True, blank=True)
+    # When the scheduler gave up waiting. A reply that Meta timestamped before
+    # this moment (queued, but not processed yet) is still handled.
+    no_answer_at = models.DateTimeField(null=True, blank=True)
     outcome_source = models.CharField(max_length=16, choices=SOURCE_CHOICES, blank=True, default="")
     last_error = models.TextField(blank=True, default="")
 
@@ -188,6 +191,18 @@ class WaqLead(models.Model):
     def awaits_reply(self):
         attempted = self.confirmation_attempted_at or self.reminder_attempted_at or self.confirmation_sent_at
         return attempted is not None and self.state not in self.REPLY_CLOSED_STATES
+
+    def answered_before_no_answer(self, message_at):
+        """In no_answer, but the customer's message (Meta time) predates the cut-off."""
+        return (
+            self.state == self.STATE_NO_ANSWER
+            and self.no_answer_at is not None
+            and message_at is not None
+            and message_at < self.no_answer_at
+        )
+
+    def accepts_reply(self, message_at):
+        return self.awaits_reply() or self.answered_before_no_answer(message_at)
 
 
 class WaqPhone(models.Model):

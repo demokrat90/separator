@@ -150,21 +150,55 @@ def test_event_processing_calls_the_waq_hook(cfg, unsigned, queued):
     assert len(queued) == 1
 
 
-def test_quality_update_is_recorded_not_raised(cfg, unsigned, alerts_sent):
+@pytest.fixture()
+def queued_alerts(monkeypatch):
+    """Alerts queued for the waq worker (tasks.deliver_alert)."""
+    calls = []
+    monkeypatch.setattr(tasks.deliver_alert, "apply_async", lambda *a, **kw: calls.append(kw))
+    return calls
+
+
+def test_quality_update_is_recorded_and_its_alert_queued(cfg, unsigned, alerts_sent, queued_alerts):
     value = {"display_phone_number": "15550100000", "event": "FLAGGED", "current_limit": "TIER_1K"}
     result = waba_utils.event_processing(raw_body=_webhook("phone_number_quality_update", value))
     assert result == "phone quality update recorded"
     event = WaqEvent.objects.get(kind=WaqEvent.KIND_QUALITY)
     assert event.data["event"] == "FLAGGED"
-    assert len(alerts_sent) == 1 and "FLAGGED" in alerts_sent[0]
+    assert alerts_sent == []  # no Telegram call from the webhook path
+    assert len(queued_alerts) == 1 and "FLAGGED" in queued_alerts[0]["args"][0]
+    assert queued_alerts[0]["retry"] is False and queued_alerts[0]["connection"] is not None
 
 
-def test_quality_update_survives_an_alert_failure(cfg, unsigned, monkeypatch):
-    from separator.waq import alerts
+def test_quality_update_survives_a_broker_failure(cfg, unsigned, monkeypatch, alerts_sent):
+    def broker_down(*args, **kwargs):
+        raise ConnectionError("broker down")
 
-    monkeypatch.setattr(alerts, "send_alert", lambda text: (_ for _ in ()).throw(RuntimeError("tg down")))
+    monkeypatch.setattr(tasks.deliver_alert, "apply_async", broker_down)
     value = {"display_phone_number": "15550100000", "event": "DOWNGRADE"}
     assert waba_utils.event_processing(raw_body=_webhook("phone_number_quality_update", value))
+    assert WaqEvent.objects.filter(kind=WaqEvent.KIND_QUALITY).count() == 1
+    assert alerts_sent == []
+
+
+def test_webhook_alerts_never_wait_for_telegram(cfg, unsigned, monkeypatch, queued_alerts):
+    """A hanging Telegram would block worker-waba: the webhook path must not call it."""
+    from separator.waq import alerts
+
+    def hanging_telegram(text):
+        raise AssertionError("Telegram called from the webhook path")
+
+    monkeypatch.setattr(alerts, "send_alert", hanging_telegram)
+    quality = {"display_phone_number": "15550100000", "event": "FLAGGED"}
+    waba_utils.event_processing(raw_body=_webhook("phone_number_quality_update", quality))
+    template = _webhook("message_template_status_update", _template_value("request_details_offer"))
+    waba_utils.event_processing(raw_body=template)
+    assert len(queued_alerts) == 2
+
+
+def test_queued_alert_is_delivered_by_the_waq_worker(alerts_sent):
+    tasks.deliver_alert("test alert text")
+    assert alerts_sent == ["test alert text"]
+    assert tasks.deliver_alert.queue == "waq"
 
 
 def _template_value(name, event="REJECTED"):
@@ -177,27 +211,28 @@ def _template_value(name, event="REJECTED"):
     }
 
 
-def test_rejected_waq_template_is_recorded_not_raised(cfg, unsigned, alerts_sent):
+def test_rejected_waq_template_is_recorded_not_raised(cfg, unsigned, alerts_sent, queued_alerts):
     raw = _webhook("message_template_status_update", _template_value("request_details_offer"))
     result = waba_utils.event_processing(raw_body=raw)
     assert "waq template status recorded" in result
     event = WaqEvent.objects.get(kind=WaqEvent.KIND_TEMPLATE_STATUS)
     assert event.data["event"] == "REJECTED"
-    assert len(alerts_sent) == 1 and "request_details_offer" in alerts_sent[0]
+    assert alerts_sent == []
+    assert len(queued_alerts) == 1 and "request_details_offer" in queued_alerts[0]["args"][0]
 
 
-def test_paused_reminder_template_is_recorded(cfg, unsigned, alerts_sent):
+def test_paused_reminder_template_is_recorded(cfg, unsigned, alerts_sent, queued_alerts):
     raw = _webhook("message_template_status_update", _template_value("request_reminder", "PAUSED"))
     waba_utils.event_processing(raw_body=raw)
     assert WaqEvent.objects.filter(kind=WaqEvent.KIND_TEMPLATE_STATUS).count() == 1
 
 
-def test_other_templates_keep_the_old_behaviour(cfg, unsigned, alerts_sent):
+def test_other_templates_keep_the_old_behaviour(cfg, unsigned, alerts_sent, queued_alerts):
     raw = _webhook("message_template_status_update", _template_value("someone_elses_template"))
     with pytest.raises(Exception):
         waba_utils.event_processing(raw_body=raw)
     assert WaqEvent.objects.count() == 0
-    assert alerts_sent == []
+    assert alerts_sent == [] and queued_alerts == []
 
 
 # ------------------------------------------------------------ broker publish
@@ -385,3 +420,21 @@ def test_hook_never_waits_for_the_gate_lock_and_the_reply_waits_only_for_the_pos
     lead.refresh_from_db()
     assert lead.state == WaqLead.STATE_QUALIFIED
     assert lead.confirmation_wamid == "wamid.OUT"
+
+
+def test_late_webhook_for_a_message_sent_before_no_answer_is_picked_up(cfg, queued):
+    """The scheduler marked the lead no_answer, then Meta delivered (late) a
+    message the customer had sent before that moment."""
+    cut_off = timezone.now() - timedelta(minutes=5)
+    make_lead(
+        state=WaqLead.STATE_NO_ANSWER,
+        no_answer_at=cut_off,
+        confirmation_attempted_at=timezone.now() - timedelta(hours=25),
+        confirmation_sent_at=timezone.now() - timedelta(hours=25),
+    )
+    value = inbound()
+    value["messages"][0]["timestamp"] = str(int((cut_off - timedelta(minutes=1)).timestamp()))
+    assert hooks.handle_inbound_value(value, cfg.phone) == ["queued"]
+    value["messages"][0]["timestamp"] = str(int((cut_off + timedelta(minutes=1)).timestamp()))
+    value["messages"][0]["id"] = "wamid.LATER"
+    assert hooks.handle_inbound_value(value, cfg.phone) == ["not ours"]
