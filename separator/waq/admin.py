@@ -19,6 +19,8 @@ class WaqSettingsAdmin(admin.ModelAdmin):
                     "template_reminder",
                     "template_language",
                     "project_fallback",
+                    "button_yes_texts",
+                    "button_no_texts",
                 )
             },
         ),

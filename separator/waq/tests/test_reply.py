@@ -64,8 +64,9 @@ def waiting_lead(**overrides):
     return make_lead(**values)
 
 
-def button(text, message_id="wamid.B1"):
-    return {"id": message_id, "type": "button", "text": text, "payload": text}
+def button(payload, message_id="wamid.B1", text="Test Button Label"):
+    """An inbound quick-reply tap as slimmed by the hook (fictional label)."""
+    return {"id": message_id, "type": "button", "text": text, "payload": payload}
 
 
 def text_message(body, message_id="wamid.T1"):
@@ -93,7 +94,7 @@ def llm(monkeypatch):
 
 def test_yes_button_qualifies(bot):
     lead = waiting_lead()
-    assert tasks.process_reply(lead.id, button("Yes, it was me")) == "qualified"
+    assert tasks.process_reply(lead.id, button("waq:yes")) == "qualified"
 
     lead.refresh_from_db()
     assert lead.state == WaqLead.STATE_QUALIFIED
@@ -115,7 +116,7 @@ def test_yes_button_qualifies(bot):
 
 def test_no_button_opts_out_and_records_the_negative_reply(bot):
     lead = waiting_lead(preferred_channel="telegram", lead_created_at=timezone.now() - timedelta(seconds=600))
-    assert tasks.process_reply(lead.id, button("No, not me")) == "not_lead"
+    assert tasks.process_reply(lead.id, button("waq:no")) == "not_lead"
 
     lead.refresh_from_db()
     assert lead.state == WaqLead.STATE_NOT_LEAD
@@ -128,7 +129,7 @@ def test_no_button_opts_out_and_records_the_negative_reply(bot):
     assert event.data["preferred_channel"] == "telegram"
     assert 590 <= event.data["seconds_from_lead"] <= 700
     # Stage untouched; a timeline comment; the bot reply mirrored to the operator.
-    assert bot.bitrix == [("crm.timeline.comment.add", comment_payload(lead, "AI: НЕ ЛИД · нажал «No, not me»"))]
+    assert bot.bitrix == [("crm.timeline.comment.add", comment_payload(lead, "AI: НЕ ЛИД · нажал кнопку «нет»"))]
     assert bot.open_line[0]["args"][1:3] == [CUSTOMER, "NOTME-TEXT"]
     assert bot.open_line[0]["countdown"] == 20 and bot.open_line[0]["kwargs"] == {"manager_id": 0}
 
@@ -222,7 +223,7 @@ def test_empty_reply_text_still_runs_the_actions(bot):
     bot.cfg.reply_qual = ""
     bot.cfg.save()
     lead = waiting_lead()
-    tasks.process_reply(lead.id, button("Yes, it was me"))
+    tasks.process_reply(lead.id, button("waq:yes"))
     lead.refresh_from_db()
     assert lead.state == WaqLead.STATE_QUALIFIED
     assert bot.graph.calls == []
@@ -234,7 +235,7 @@ def test_manual_stop_blocks_the_reply_but_not_bitrix(bot):
     bot.cfg.enabled = False
     bot.cfg.save()
     lead = waiting_lead()
-    tasks.process_reply(lead.id, button("Yes, it was me"))
+    tasks.process_reply(lead.id, button("waq:yes"))
     assert bot.graph.calls == []  # no outbound WhatsApp at all
     assert bot.open_line == []  # nothing was sent, nothing to mirror
     lead.refresh_from_db()
@@ -250,12 +251,12 @@ def test_manual_stop_note_on_a_negative_reply(bot):
     bot.cfg.enabled = False
     bot.cfg.save()
     lead = waiting_lead()
-    tasks.process_reply(lead.id, button("No, not me"))
+    tasks.process_reply(lead.id, button("waq:no"))
     assert bot.graph.calls == []
     assert bot.bitrix == [
         (
             "crm.timeline.comment.add",
-            comment_payload(lead, "AI: НЕ ЛИД · нажал «No, not me» · ответ клиенту не отправлен: ручной стоп"),
+            comment_payload(lead, "AI: НЕ ЛИД · нажал кнопку «нет» · ответ клиенту не отправлен: ручной стоп"),
         )
     ]
 
@@ -265,7 +266,7 @@ def test_autostop_blocks_only_templates_not_replies(bot):
     bot.cfg.autostop_reason = "test"
     bot.cfg.save()
     lead = waiting_lead()
-    assert tasks.process_reply(lead.id, button("Yes, it was me")) == "qualified"
+    assert tasks.process_reply(lead.id, button("waq:yes")) == "qualified"
     assert sent_texts(bot.graph) == ["QUAL-TEXT"]
     assert len(bot.open_line) == 1
     assert [method for method, _ in bot.bitrix] == ["crm.deal.update", "crm.timeline.comment.add"]
@@ -301,7 +302,7 @@ def test_every_bot_reply_is_mirrored_and_commented(bot, llm, label, reply, comme
 def test_failed_reply_is_noted_and_not_mirrored(bot):
     bot.graph.error = "outside the 24h window"
     lead = waiting_lead()
-    tasks.process_reply(lead.id, button("Yes, it was me"))
+    tasks.process_reply(lead.id, button("waq:yes"))
     assert bot.open_line == []
     assert bot.bitrix[-1][1]["fields"]["COMMENT"].endswith("ответ клиенту не отправлен: ошибка отправки")
 
@@ -314,14 +315,14 @@ def test_bitrix_failure_does_not_cancel_the_rest(bot, monkeypatch):
 
     monkeypatch.setattr(crest, "call_method", broken)
     lead = waiting_lead()
-    assert tasks.process_reply(lead.id, button("Yes, it was me")) == "qualified"
+    assert tasks.process_reply(lead.id, button("waq:yes")) == "qualified"
     assert sent_texts(bot.graph) == ["QUAL-TEXT"]
     assert WaqEvent.objects.filter(kind=WaqEvent.KIND_BITRIX_ERROR).count() == 2
 
 
 def test_already_qualified_lead_is_left_alone(bot):
     lead = waiting_lead(state=WaqLead.STATE_QUALIFIED)
-    assert tasks.process_reply(lead.id, button("No, not me")) == "not waiting"
+    assert tasks.process_reply(lead.id, button("waq:no")) == "not waiting"
     assert bot.graph.calls == []
 
 
@@ -346,7 +347,7 @@ def test_third_negative_reply_in_24h_triggers_autostop(bot, django_capture_on_co
     _negatives(2)
     lead = waiting_lead()
     with django_capture_on_commit_callbacks(execute=True):
-        tasks.process_reply(lead.id, button("No, not me"))
+        tasks.process_reply(lead.id, button("waq:no"))
     settings_row = WaqSettings.load()
     assert settings_row.autostop_active is True
     assert "3 negative replies" in settings_row.autostop_reason
@@ -358,7 +359,7 @@ def test_old_negative_replies_do_not_count(bot):
     _negatives(2)
     WaqEvent.objects.update(created_at=timezone.now() - timedelta(hours=25))
     lead = waiting_lead()
-    tasks.process_reply(lead.id, button("No, not me"))
+    tasks.process_reply(lead.id, button("waq:no"))
     assert WaqSettings.load().autostop_active is False
 
 
@@ -368,7 +369,7 @@ def test_negative_share_above_30_percent_triggers_autostop(bot):
         make_lead(phone=f"+1555010{2000 + i}", state=WaqLead.STATE_REMINDER_SENT, confirmation_sent_at=timezone.now())
     _negatives(1)
     lead = waiting_lead()
-    tasks.process_reply(lead.id, button("No, not me"))
+    tasks.process_reply(lead.id, button("waq:no"))
     settings_row = WaqSettings.load()
     assert settings_row.autostop_active is True
     assert "2 negative replies to 5 confirmations" in settings_row.autostop_reason
@@ -379,7 +380,7 @@ def test_negative_share_at_20_percent_does_not_trigger(bot):
         make_lead(phone=f"+1555010{3000 + i}", state=WaqLead.STATE_REMINDER_SENT, confirmation_sent_at=timezone.now())
     _negatives(1)
     lead = waiting_lead()
-    tasks.process_reply(lead.id, button("No, not me"))
+    tasks.process_reply(lead.id, button("waq:no"))
     assert WaqSettings.load().autostop_active is False
 
 
@@ -489,7 +490,7 @@ CREDIT_MESSAGE = "Your credit balance is too low to access the Anthropic API."
 def test_credit_balance_error_goes_to_the_unavailable_branch(bot, fake_sdk):
     fake_sdk.error = _api_error(400, CREDIT_MESSAGE)
     lead = waiting_lead()
-    assert tasks.process_reply(lead.id, text_message("yes it was me")) == "unclassified"
+    assert tasks.process_reply(lead.id, text_message("yes that was my enquiry")) == "unclassified"
 
     lead.refresh_from_db()
     assert lead.state == WaqLead.STATE_CONFIRMATION_SENT  # keeps waiting
@@ -523,8 +524,8 @@ def test_buttons_work_without_the_llm(bot, fake_sdk):
     fake_sdk.error = _api_error(400, CREDIT_MESSAGE)
     yes_lead = waiting_lead()
     no_lead = waiting_lead(phone="+15550100003")
-    assert tasks.process_reply(yes_lead.id, button("Yes, it was me")) == "qualified"
-    assert tasks.process_reply(no_lead.id, button("No, not me", message_id="wamid.B2")) == "not_lead"
+    assert tasks.process_reply(yes_lead.id, button("waq:yes")) == "qualified"
+    assert tasks.process_reply(no_lead.id, button("waq:no", message_id="wamid.B2")) == "not_lead"
     assert fake_sdk.requests == []  # Claude was never called
     assert bot.alerts == []
 
@@ -571,7 +572,7 @@ def test_autostop_is_on_before_any_external_call(bot, monkeypatch):
     monkeypatch.setattr(tasks, "post_message", reply_post)
     lead = waiting_lead()
     with pytest.raises(WorkerKilled):
-        tasks.process_reply(lead.id, button("No, not me"))
+        tasks.process_reply(lead.id, button("waq:no"))
     assert seen == [(True, 3)]
     assert WaqSettings.load().autostop_active is True
     assert bot.bitrix == []  # Bitrix comes after the reply; never reached here
@@ -586,7 +587,7 @@ def test_manual_stop_pressed_just_before_the_reply_wins(bot, monkeypatch):
 
     monkeypatch.setattr(tasks, "_reply_text", text_then_stop)
     lead = waiting_lead()
-    tasks.process_reply(lead.id, button("Yes, it was me"))
+    tasks.process_reply(lead.id, button("waq:yes"))
     assert bot.graph.calls == []
     assert bot.bitrix[-1][1]["fields"]["COMMENT"].endswith("ответ клиенту не отправлен: ручной стоп")
 
@@ -596,7 +597,7 @@ def test_who_reply_is_dropped_if_the_dialogue_closed_meanwhile(bot, llm, monkeyp
     real_reply_text = tasks._reply_text
 
     def text_after_another_message_closed_it(cfg, lead, label):
-        # A "Yes, it was me" processed in parallel has just qualified the lead.
+        # A "yes" button processed in parallel has just qualified the lead.
         WaqLead.objects.filter(pk=lead.pk).update(state=WaqLead.STATE_QUALIFIED)
         return real_reply_text(cfg, lead, label)
 
@@ -623,7 +624,7 @@ def test_first_reply_time_is_kept(bot, llm):
     tasks.process_reply(lead.id, text_message("who is this?", message_id="wamid.T1"))
     lead.refresh_from_db()
     first = lead.replied_at
-    tasks.process_reply(lead.id, button("Yes, it was me", message_id="wamid.B9"))
+    tasks.process_reply(lead.id, button("waq:yes", message_id="wamid.B9"))
     lead.refresh_from_db()
     assert lead.state == WaqLead.STATE_QUALIFIED
     assert lead.replied_at == first
@@ -651,3 +652,49 @@ def test_compose_has_a_waq_worker_and_keeps_the_others():
     assert waq["command"] == "/start-celeryworker"
     assert services["worker-misc"]["environment"]["CELERY_QUEUE"] == "bitrix,default,bitbot,olx,waweb"
     assert services["worker-waba"]["environment"]["CELERY_QUEUE"] == "waba,waba_messages"
+
+
+# ------------------------------------------------- button recognition (payload first)
+
+
+def test_buttons_are_recognized_by_payload_whatever_their_text(bot, fake_sdk):
+    yes_lead = waiting_lead()
+    no_lead = waiting_lead(phone="+15550100004")
+    assert tasks.process_reply(yes_lead.id, button("waq:yes", text="Any Label 1")) == "qualified"
+    assert tasks.process_reply(no_lead.id, button("waq:no", message_id="wamid.B2", text="Any Label 2")) == "not_lead"
+    assert fake_sdk.requests == []  # no LLM for a recognized button
+
+
+def test_unknown_payload_falls_back_to_the_configured_texts(bot, fake_sdk):
+    bot.cfg.button_yes_texts = "Test Yes Label\nTest Yes Alt"
+    bot.cfg.button_no_texts = "Test No Label"
+    bot.cfg.save()
+    yes_lead = waiting_lead()
+    no_lead = waiting_lead(phone="+15550100005")
+    assert tasks.process_reply(yes_lead.id, button("legacy-payload", text="  test yes alt ")) == "qualified"
+    assert tasks.process_reply(no_lead.id, button("legacy-payload", message_id="wamid.B3", text="Test No Label")) == "not_lead"
+    yes_lead.refresh_from_db()
+    assert yes_lead.outcome_source == "button"
+    assert fake_sdk.requests == []
+
+
+def test_unrecognized_button_goes_to_the_llm_as_text(bot, fake_sdk):
+    fake_sdk.answer = "WHO"
+    lead = waiting_lead()
+    assert tasks.process_reply(lead.id, button("legacy-payload", text="Unknown Label")) == "who"
+    assert len(fake_sdk.requests) == 1
+    assert "Unknown Label" in fake_sdk.requests[0]["messages"][0]["content"]
+
+
+def test_default_button_texts_are_empty(db):
+    from separator.waq.models import WaqSettings as Settings
+
+    fresh = Settings()
+    assert fresh.button_yes_texts == "" and fresh.button_no_texts == ""
+    # With nothing configured, a text-only match is impossible: only payloads count.
+    assert classify.classify_local({"type": "button", "text": "Yes", "payload": ""}) == (None, None)
+
+
+def test_text_configured_as_both_yes_and_no_is_not_trusted():
+    message = {"type": "button", "text": "Same", "payload": "other"}
+    assert classify.classify_local(message, "Same", "Same") == (None, None)

@@ -20,9 +20,11 @@ MAX_RETRIES = 1  # bounded: one retry at most, never an endless loop
 MAX_TOKENS = 4000  # thinking is always on for this model and counts here
 MAX_TEXT_CHARS = 2000
 
-# Template quick-reply buttons (matched case-insensitively, trimmed).
-BUTTON_YES = "yes, it was me"
-BUTTON_NO = "no, not me"
+# Quick-reply payloads we put on the template buttons at send time
+# (gate.build_template_payload): index 0 = yes, index 1 = no. Meta echoes the
+# payload back in `button.payload` when the customer taps the button.
+PAYLOAD_YES = "waq:yes"
+PAYLOAD_NO = "waq:no"
 
 MEDIA_TYPES = ("audio", "voice", "image", "video", "document")
 
@@ -121,17 +123,34 @@ def message_text(message):
     return str(message.get("text") or "").strip()
 
 
-def classify_local(message):
-    """(class, outcome_source) for buttons and media, or (None, None) for text."""
+def text_set(value):
+    """Admin-configured button texts: one per line, compared case-insensitively."""
+    return {line.strip().lower() for line in str(value or "").splitlines() if line.strip()}
+
+
+def classify_local(message, yes_texts="", no_texts=""):
+    """(class, outcome_source) for buttons and media, or (None, None) for text.
+
+    A button is recognized by its payload first (ours: waq:yes / waq:no), then
+    by its visible text against the configured button texts (WaqSettings
+    button_yes_texts / button_no_texts). Unrecognized -> free text (LLM).
+    """
     mtype = (message or {}).get("type")
     text = message_text(message)
     if mtype in ("button", "interactive"):
-        candidates = {text.lower(), str((message or {}).get("payload") or "").strip().lower()}
-        if BUTTON_YES in candidates:
+        payload = str((message or {}).get("payload") or "").strip()
+        if payload == PAYLOAD_YES:
             return QUAL, "button"
-        if BUTTON_NO in candidates:
+        if payload == PAYLOAD_NO:
             return NOT_LEAD, "button"
-        # Some other button: its text is classified like a typed message.
+        lowered = text.lower()
+        is_yes = bool(lowered) and lowered in text_set(yes_texts)
+        is_no = bool(lowered) and lowered in text_set(no_texts)
+        if is_yes and not is_no:
+            return QUAL, "button"
+        if is_no and not is_yes:
+            return NOT_LEAD, "button"
+        # Unknown button (or a text configured as both): classified like a typed message.
         return (None, None) if text else (IGNORED, None)
     if mtype in MEDIA_TYPES:
         return QUAL, "media"

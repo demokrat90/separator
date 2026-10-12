@@ -28,10 +28,22 @@ def test_all_clear_sends_the_utility_template(cfg, graph, alerts_sent):
     payload = call["payload"]
     assert payload["to"] == CUSTOMER.lstrip("+")
     assert payload["type"] == "template"
-    assert payload["template"]["name"] == "request_confirmation"
+    assert payload["template"]["name"] == "request_details_offer"
     assert payload["template"]["language"] == {"code": "en"}
     assert payload["template"]["components"] == [
-        {"type": "body", "parameters": [{"type": "text", "text": "Test Project"}]}
+        {"type": "body", "parameters": [{"type": "text", "text": "Test Project"}]},
+        {
+            "type": "button",
+            "sub_type": "quick_reply",
+            "index": "0",
+            "parameters": [{"type": "payload", "payload": "waq:yes"}],
+        },
+        {
+            "type": "button",
+            "sub_type": "quick_reply",
+            "index": "1",
+            "parameters": [{"type": "payload", "payload": "waq:no"}],
+        },
     ]
 
     lead.refresh_from_db()
@@ -52,7 +64,7 @@ def test_empty_project_uses_the_fallback(cfg, graph):
 
 def test_utility_template_copy_is_not_rerouted_to_marketing_messages(cfg, graph, sender):
     Template.objects.create(
-        id="tpl-1", waba=sender.waba, name="request_confirmation", lang="en", category="UTILITY", status="APPROVED"
+        id="tpl-1", waba=sender.waba, name="request_details_offer", lang="en", category="UTILITY", status="APPROVED"
     )
     lead = make_lead()
     assert gate(lead.id, KIND_CONFIRMATION).sent
@@ -62,7 +74,7 @@ def test_utility_template_copy_is_not_rerouted_to_marketing_messages(cfg, graph,
 
 def test_marketing_template_copy_is_refused(cfg, graph, sender, alerts_sent, django_capture_on_commit_callbacks):
     Template.objects.create(
-        id="tpl-2", waba=sender.waba, name="request_confirmation", lang="en", category="MARKETING", status="APPROVED"
+        id="tpl-2", waba=sender.waba, name="request_details_offer", lang="en", category="MARKETING", status="APPROVED"
     )
     lead = make_lead()
     with django_capture_on_commit_callbacks(execute=True):

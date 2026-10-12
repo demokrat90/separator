@@ -33,9 +33,13 @@ class WaqSettings(models.Model):
         related_name="+",
         help_text="Sender number for the templates and the bot replies",
     )
-    template_confirmation = models.CharField(max_length=255, default="request_confirmation")
+    template_confirmation = models.CharField(max_length=255, default="request_details_offer")
     template_reminder = models.CharField(max_length=255, default="request_reminder")
     template_language = models.CharField(max_length=16, default="en")
+    # Fallback recognition of the template's quick-reply buttons by their
+    # visible text, one text per line (the payload is checked first).
+    button_yes_texts = models.TextField(blank=True, default="", help_text="One text per line")
+    button_no_texts = models.TextField(blank=True, default="", help_text="One text per line")
     project_fallback = models.CharField(
         max_length=255, blank=True, default="", help_text="Template {{1}} when the lead has no project"
     )

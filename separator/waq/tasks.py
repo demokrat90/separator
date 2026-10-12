@@ -35,7 +35,7 @@ COMMENT_LABELS = {
     classify.BOT: "спросил, не бот ли",
 }
 MEDIA_LABEL = "медиа, не расшифровано"
-NOT_LEAD_BUTTON_LABEL = "нажал «No, not me»"
+NOT_LEAD_BUTTON_LABEL = "нажал кнопку «нет»"
 NOT_LEAD_TEXT_LABEL = "по тексту ответа: не оставлял заявку / ошибся номером / спам / не по делу"
 OUTCOME_COMMENTS = {
     classify.STOP: "AI: СТОП",
@@ -173,7 +173,8 @@ def process_reply(lead_id, message):
     if _already_processed(lead_id, message_id):
         return "duplicate"
 
-    label, source = classify.classify_local(message)
+    buttons = WaqSettings.load()
+    label, source = classify.classify_local(message, buttons.button_yes_texts, buttons.button_no_texts)
     llm_error = None
     llm_error_kind = None
     if label is None:

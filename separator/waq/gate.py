@@ -27,7 +27,7 @@ import requests
 from django.db import transaction
 from django.utils import timezone
 
-from . import alerts, localtime
+from . import alerts, classify, localtime
 from .models import WaqEvent, WaqLead, WaqPhone, WaqSettings
 
 logger = logging.getLogger("django")
@@ -127,10 +127,21 @@ def build_template_payload(cfg, lead, kind):
         "name": cfg.template_for(kind).strip(),
         "language": {"code": cfg.template_language.strip()},
     }
+    components = []
     if project:
-        template["components"] = [
-            {"type": "body", "parameters": [{"type": "text", "text": project}]}
-        ]
+        components.append({"type": "body", "parameters": [{"type": "text", "text": project}]})
+    # Quick-reply buttons: index 0 = yes, index 1 = no; Meta returns the payload
+    # in the inbound `button.payload`, so the reply never depends on the text.
+    for index, payload in (("0", classify.PAYLOAD_YES), ("1", classify.PAYLOAD_NO)):
+        components.append(
+            {
+                "type": "button",
+                "sub_type": "quick_reply",
+                "index": index,
+                "parameters": [{"type": "payload", "payload": payload}],
+            }
+        )
+    template["components"] = components
     return {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",

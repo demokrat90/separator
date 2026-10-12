@@ -92,13 +92,14 @@ def test_button_reply_is_slimmed(cfg, queued):
         "id": "wamid.IN2",
         "from": CUSTOMER.lstrip("+"),
         "type": "button",
-        "button": {"text": "Yes, it was me", "payload": "Yes, it was me"},
+        "button": {"text": "Test Button Label", "payload": "waq:yes"},
         "context": {"id": "wamid.OUT"},
     }
     hooks.handle_inbound_value(value, cfg.phone)
     message = queued[0]["args"][1]
     assert message["type"] == "button"
-    assert message["text"] == "Yes, it was me"
+    assert message["text"] == "Test Button Label"
+    assert message["payload"] == "waq:yes"
 
 
 def test_exception_inside_the_hook_never_escapes(cfg, monkeypatch):
@@ -177,12 +178,12 @@ def _template_value(name, event="REJECTED"):
 
 
 def test_rejected_waq_template_is_recorded_not_raised(cfg, unsigned, alerts_sent):
-    raw = _webhook("message_template_status_update", _template_value("request_confirmation"))
+    raw = _webhook("message_template_status_update", _template_value("request_details_offer"))
     result = waba_utils.event_processing(raw_body=raw)
     assert "waq template status recorded" in result
     event = WaqEvent.objects.get(kind=WaqEvent.KIND_TEMPLATE_STATUS)
     assert event.data["event"] == "REJECTED"
-    assert len(alerts_sent) == 1 and "request_confirmation" in alerts_sent[0]
+    assert len(alerts_sent) == 1 and "request_details_offer" in alerts_sent[0]
 
 
 def test_paused_reminder_template_is_recorded(cfg, unsigned, alerts_sent):
@@ -256,7 +257,7 @@ def test_reply_after_a_timed_out_confirmation_is_still_handled(cfg, monkeypatch,
         "id": "wamid.YES",
         "from": CUSTOMER.lstrip("+"),
         "type": "button",
-        "button": {"text": "Yes, it was me", "payload": "Yes, it was me"},
+        "button": {"text": "Test Button Label", "payload": "waq:yes"},
     }
     assert hooks.handle_inbound_value(value, cfg.phone) == ["queued"]
 
