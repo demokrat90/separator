@@ -54,7 +54,7 @@ REPLY_NOTES = {
     REPLY_FAILED: "ответ клиенту не отправлен: ошибка отправки",
     REPLY_CLOSED: "ответ клиенту не отправлен: диалог уже закрыт",
 }
-CLOSED_STATES = (WaqLead.STATE_QUALIFIED, WaqLead.STATE_NOT_LEAD, WaqLead.STATE_STOPPED)
+CLOSING_STATES = (WaqLead.STATE_QUALIFIED, WaqLead.STATE_NOT_LEAD, WaqLead.STATE_STOPPED)
 
 
 # --------------------------------------------------------------------------- send
@@ -81,8 +81,8 @@ def run_schedule():
     # Counted from the first template attempt, so a confirmation with an
     # unknown outcome (timeout) also ends as no_answer.
     expired = WaqLead.objects.filter(
+        WaqLead.awaiting_reply_q(),
         Q(confirmation_attempted_at__lte=answer_deadline) | Q(confirmation_sent_at__lte=answer_deadline),
-        state__in=WaqLead.WAITING_STATES,
         replied_at__isnull=True,
     ).update(state=WaqLead.STATE_NO_ANSWER)
 
@@ -168,7 +168,7 @@ def process_reply(lead_id, message):
 
     # Cheap pre-check before any paid call; repeated under the lock below.
     lead = WaqLead.objects.filter(pk=lead_id).first()
-    if lead is None or lead.state not in WaqLead.WAITING_STATES:
+    if lead is None or not lead.awaits_reply():
         return "not waiting"
     if _already_processed(lead_id, message_id):
         return "duplicate"
@@ -201,8 +201,11 @@ def process_reply(lead_id, message):
             # Lock order settings -> lead -> phone, as in the gate: the autostop
             # check below happens in this same transaction.
             locked_cfg = WaqSettings.objects.select_for_update(of=("self",)).get(pk=WaqSettings.SINGLETON_PK)
+        # May wait here while the gate holds this row during a template POST
+        # (bounded by the Graph timeout); this runs on the waq worker, not on
+        # the inbound path.
         lead = WaqLead.objects.select_for_update().filter(pk=lead_id).first()
-        if lead is None or lead.state not in WaqLead.WAITING_STATES:
+        if lead is None or not lead.awaits_reply():
             return "not waiting"
         if _already_processed(lead_id, message_id):
             return "duplicate"
@@ -262,9 +265,9 @@ def process_reply(lead_id, message):
     #    about templates; the customer wrote to us first). The closing reply
     #    belongs to the state this message set; WHO/COMPANY only while waiting.
     is_qual = label in (classify.QUAL, classify.QUAL_QUESTION, classify.BOT)
-    allowed_states = (lead.state,) if lead.state in CLOSED_STATES else WaqLead.WAITING_STATES
+    closing_state = lead.state if lead.state in CLOSING_STATES else None
     reply = (_reply_text(cfg, lead, label) or "").strip()
-    reply_status = _send_reply(lead.id, reply, allowed_states) if reply else REPLY_EMPTY
+    reply_status = _send_reply(lead.id, reply, closing_state) if reply else REPLY_EMPTY
     # 2. The operator sees every message the bot actually sent.
     if reply_status == REPLY_SENT:
         _show_in_open_line(cfg, lead, reply)
@@ -303,7 +306,7 @@ def _record_failure(lead, kind, error):
         logger.error("waq: could not record %s: %s", kind, exc)
 
 
-def _send_reply(lead_id, text, allowed_states):
+def _send_reply(lead_id, text, closing_state=None):
     """Session text message (the customer's reply opened the window).
 
     Runs under the lead's row lock, so two replies for one lead never race:
@@ -313,7 +316,10 @@ def _send_reply(lead_id, text, allowed_states):
     """
     with transaction.atomic():
         lead = WaqLead.objects.select_for_update().get(pk=lead_id)
-        if lead.state not in allowed_states:
+        # The closing reply belongs to the state this message set; any other
+        # reply (WHO/COMPANY) only while the lead still awaits a reply.
+        allowed = lead.state == closing_state if closing_state else lead.awaits_reply()
+        if not allowed:
             return REPLY_CLOSED
         cfg = WaqSettings.objects.select_related("phone", "phone__waba").get(pk=WaqSettings.SINGLETON_PK)
         if not cfg.enabled:
@@ -423,7 +429,8 @@ def _autostop_if_needed(cfg, now):
         return False
     since = now - timedelta(hours=24)
     negatives = WaqEvent.objects.filter(kind=WaqEvent.KIND_NEGATIVE_REPLY, created_at__gte=since).count()
-    confirmations = WaqLead.objects.filter(confirmation_sent_at__gte=since).count()
+    # Attempts, like the caps: a timed-out confirmation may well have arrived.
+    confirmations = WaqLead.objects.filter(confirmation_attempted_at__gte=since).count()
     reason = ""
     if negatives >= AUTOSTOP_NEGATIVE_ABS:
         reason = f"{negatives} negative replies in 24h"

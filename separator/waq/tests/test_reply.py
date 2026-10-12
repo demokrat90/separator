@@ -58,6 +58,7 @@ def comment_payload(lead, text):
 def waiting_lead(**overrides):
     values = {
         "state": WaqLead.STATE_CONFIRMATION_SENT,
+        "confirmation_attempted_at": timezone.now() - timedelta(hours=1),
         "confirmation_sent_at": timezone.now() - timedelta(hours=1),
     }
     values.update(overrides)
@@ -366,7 +367,12 @@ def test_old_negative_replies_do_not_count(bot):
 def test_negative_share_above_30_percent_triggers_autostop(bot):
     # 5 confirmations in 24h (the lead itself is one of them), 2 negatives = 40%.
     for i in range(4):
-        make_lead(phone=f"+1555010{2000 + i}", state=WaqLead.STATE_REMINDER_SENT, confirmation_sent_at=timezone.now())
+        make_lead(
+            phone=f"+1555010{2000 + i}",
+            state=WaqLead.STATE_REMINDER_SENT,
+            confirmation_sent_at=timezone.now(),
+            confirmation_attempted_at=timezone.now(),
+        )
     _negatives(1)
     lead = waiting_lead()
     tasks.process_reply(lead.id, button("waq:no"))
@@ -377,7 +383,12 @@ def test_negative_share_above_30_percent_triggers_autostop(bot):
 
 def test_negative_share_at_20_percent_does_not_trigger(bot):
     for i in range(9):
-        make_lead(phone=f"+1555010{3000 + i}", state=WaqLead.STATE_REMINDER_SENT, confirmation_sent_at=timezone.now())
+        make_lead(
+            phone=f"+1555010{3000 + i}",
+            state=WaqLead.STATE_REMINDER_SENT,
+            confirmation_sent_at=timezone.now(),
+            confirmation_attempted_at=timezone.now(),
+        )
     _negatives(1)
     lead = waiting_lead()
     tasks.process_reply(lead.id, button("waq:no"))
@@ -698,3 +709,44 @@ def test_default_button_texts_are_empty(db):
 def test_text_configured_as_both_yes_and_no_is_not_trusted():
     message = {"type": "button", "text": "Same", "payload": "other"}
     assert classify.classify_local(message, "Same", "Same") == (None, None)
+
+
+def test_autostop_share_counts_attempts_not_only_confirmed_sends(bot):
+    """5 confirmations attempted in 24h (timeouts: no sent_at), 2 negatives = 40%."""
+    for i in range(4):
+        make_lead(
+            phone=f"+1555010{5000 + i}",
+            state=WaqLead.STATE_CONFIRMATION_UNKNOWN,
+            confirmation_attempted_at=timezone.now(),
+        )
+    _negatives(1)
+    lead = waiting_lead()
+    tasks.process_reply(lead.id, button("waq:no"))
+    settings_row = WaqSettings.load()
+    assert settings_row.autostop_active is True
+    assert "2 negative replies to 5 confirmations" in settings_row.autostop_reason
+
+
+def test_reply_to_a_lead_whose_post_never_finished_is_handled(bot):
+    """The worker died after Meta delivered the template: state is still
+    `received`, but the attempt is on record - the customer's tap counts."""
+    lead = make_lead(confirmation_attempted_at=timezone.now() - timedelta(minutes=2))
+    assert lead.state == WaqLead.STATE_RECEIVED
+    assert tasks.process_reply(lead.id, button("waq:yes")) == "qualified"
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_QUALIFIED
+
+
+@pytest.mark.parametrize(
+    "state",
+    [WaqLead.STATE_BLOCKED, WaqLead.STATE_FAILED, WaqLead.STATE_NO_ANSWER, WaqLead.STATE_STOPPED],
+)
+def test_closed_leads_ignore_replies_even_with_an_attempt(bot, state):
+    lead = make_lead(state=state, confirmation_attempted_at=timezone.now())
+    assert tasks.process_reply(lead.id, button("waq:yes")) == "not waiting"
+    assert bot.graph.calls == []
+
+
+def test_received_lead_without_an_attempt_is_not_waiting(bot):
+    lead = make_lead()
+    assert tasks.process_reply(lead.id, button("waq:yes")) == "not waiting"

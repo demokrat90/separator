@@ -358,7 +358,16 @@ def is_definite_rejection(exc):
 
 
 def _last_look(lead, phone_row, kind):
-    """Everything that may have changed since the attempt was recorded."""
+    """Everything that may have changed since the attempt was recorded.
+
+    The lead and the number rows are locked by the caller; the settings row is
+    deliberately read WITHOUT a lock. Accepted risk: a manual stop or an
+    autostop committed in the fraction of a second between this read and the
+    start of the POST does not stop this one template. Holding the settings
+    lock for the whole POST would instead serialize every reply behind the
+    Graph timeout and risk a lock-order deadlock with process_reply (which
+    takes settings -> lead for a NOT_LEAD).
+    """
     fresh = (
         WaqSettings.objects.filter(pk=WaqSettings.SINGLETON_PK)
         .values("enabled", "autostop_active", "reminder_enabled")

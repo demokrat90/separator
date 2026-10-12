@@ -272,3 +272,116 @@ def test_reply_after_a_timed_out_confirmation_is_still_handled(cfg, monkeypatch,
 def test_definitely_failed_confirmation_is_not_waited_on(cfg, queued):
     make_lead(state=WaqLead.STATE_FAILED, confirmation_attempted_at=timezone.now())
     assert hooks.handle_inbound_value(inbound(), cfg.phone) == ["not ours"]
+
+
+def test_tap_while_the_template_post_is_in_flight_is_queued(cfg, monkeypatch, queued):
+    """Meta delivered, the customer tapped, the HTTP answer is still on its way:
+    the lead is `received` with an attempt on record - the hook must find it."""
+    from separator.waba import utils as waba_utils
+    from separator.waq.gate import KIND_CONFIRMATION, gate
+
+    seen_by_hook = []
+
+    def slow_meta(**kwargs):
+        value = inbound()
+        value["messages"][0] = {
+            "id": "wamid.TAP",
+            "from": CUSTOMER.lstrip("+"),
+            "type": "button",
+            "button": {"text": "Test Button Label", "payload": "waq:yes"},
+        }
+        seen_by_hook.append(hooks.handle_inbound_value(value, cfg.phone))
+        return {"messages": [{"id": "wamid.OUT"}]}
+
+    monkeypatch.setattr(waba_utils, "call_api", slow_meta)
+    lead = make_lead()
+    assert gate(lead.id, KIND_CONFIRMATION).sent
+    assert seen_by_hook == [["queued"]]
+    assert queued[0]["args"][0] == lead.id
+
+
+@pytest.mark.parametrize("state", [WaqLead.STATE_BLOCKED, WaqLead.STATE_FAILED, WaqLead.STATE_NO_ANSWER])
+def test_closed_lead_with_an_attempt_is_not_picked_up(cfg, queued, state):
+    make_lead(state=state, confirmation_attempted_at=timezone.now())
+    assert hooks.handle_inbound_value(inbound(), cfg.phone) == ["not ours"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_hook_never_waits_for_the_gate_lock_and_the_reply_waits_only_for_the_post(sender, monkeypatch):
+    """Real Postgres locks: while the gate holds the lead row during a slow POST,
+    the hook answers at once (plain SELECT) and process_reply waits for the row,
+    then qualifies the lead; the late HTTP answer does not undo it."""
+    import threading
+    import time
+
+    from django.db import connection
+
+    from separator.waba import utils as waba_utils
+    from separator.waq.gate import KIND_CONFIRMATION, gate
+    from separator.waq.models import WaqSettings
+
+    settings_row = WaqSettings.load()
+    settings_row.enabled = True
+    settings_row.phone = sender
+    settings_row.save()
+
+    in_flight = threading.Event()
+    release = threading.Event()
+
+    def slow_meta(**kwargs):
+        in_flight.set()
+        release.wait(10)
+        return {"messages": [{"id": "wamid.OUT"}]}
+
+    monkeypatch.setattr(waba_utils, "call_api", slow_meta)
+    queued = []
+    monkeypatch.setattr(tasks.process_reply, "apply_async", lambda *a, **kw: queued.append(kw["args"]))
+    monkeypatch.setattr(tasks, "_send_reply", lambda *a, **kw: tasks.REPLY_EMPTY)
+    monkeypatch.setattr(tasks, "_update_deal", lambda *a, **kw: None)
+    monkeypatch.setattr(tasks, "_timeline_comment", lambda *a, **kw: None)
+
+    lead = make_lead()
+    results = {}
+
+    def run_gate():
+        try:
+            results["gate"] = gate(lead.id, KIND_CONFIRMATION).status
+        finally:
+            connection.close()
+
+    def run_reply(args):
+        try:
+            started = time.monotonic()
+            results["reply"] = tasks.process_reply(*args)
+            results["reply_waited"] = time.monotonic() - started
+        finally:
+            connection.close()
+
+    gate_thread = threading.Thread(target=run_gate)
+    gate_thread.start()
+    assert in_flight.wait(10)
+
+    value = inbound()
+    value["messages"][0] = {
+        "id": "wamid.TAP2",
+        "from": CUSTOMER.lstrip("+"),
+        "type": "button",
+        "button": {"text": "Test Button Label", "payload": "waq:yes"},
+    }
+    started = time.monotonic()
+    assert hooks.handle_inbound_value(value, sender) == ["queued"]
+    assert time.monotonic() - started < 1.0  # no lock wait on the inbound path
+
+    reply_thread = threading.Thread(target=run_reply, args=(queued[0],))
+    reply_thread.start()
+    time.sleep(0.5)
+    assert "reply" not in results  # waiting for the row the gate holds
+    release.set()
+    gate_thread.join(10)
+    reply_thread.join(10)
+
+    assert results["gate"] == "sent"
+    assert results["reply"] == "qualified"
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_QUALIFIED
+    assert lead.confirmation_wamid == "wamid.OUT"

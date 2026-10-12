@@ -116,8 +116,16 @@ class WaqLead(models.Model):
         (STATE_NO_ANSWER, "no answer"),
         (STATE_FAILED, "failed"),
     ]
-    # States in which the customer's reply is still awaited.
-    WAITING_STATES = (STATE_CONFIRMATION_SENT, STATE_CONFIRMATION_UNKNOWN, STATE_REMINDER_SENT)
+    # The dialogue is over: no reply of the customer is handled any more.
+    # `failed` = Meta rejected the template with a 4xx, nothing was delivered.
+    REPLY_CLOSED_STATES = (
+        STATE_QUALIFIED,
+        STATE_NOT_LEAD,
+        STATE_STOPPED,
+        STATE_NO_ANSWER,
+        STATE_BLOCKED,
+        STATE_FAILED,
+    )
 
     SOURCE_BUTTON = "button"
     SOURCE_LLM = "llm"
@@ -163,6 +171,23 @@ class WaqLead(models.Model):
 
     def __str__(self):
         return f"deal {self.deal_id} ({self.state})"
+
+    # A lead awaits the customer's reply as soon as a template was ATTEMPTED and
+    # until the dialogue is closed - whatever the state says about the POST: the
+    # request may still be in flight (state still `received`) or the worker may
+    # have died after Meta delivered the message.
+    @classmethod
+    def awaiting_reply_q(cls):
+        attempted = (
+            models.Q(confirmation_attempted_at__isnull=False)
+            | models.Q(reminder_attempted_at__isnull=False)
+            | models.Q(confirmation_sent_at__isnull=False)
+        )
+        return attempted & ~models.Q(state__in=cls.REPLY_CLOSED_STATES)
+
+    def awaits_reply(self):
+        attempted = self.confirmation_attempted_at or self.reminder_attempted_at or self.confirmation_sent_at
+        return attempted is not None and self.state not in self.REPLY_CLOSED_STATES
 
 
 class WaqPhone(models.Model):

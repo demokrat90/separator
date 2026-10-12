@@ -102,15 +102,16 @@ def handle_inbound_value(value, phone=None):
                 if not customer or not message.get("id"):
                     handled.append("no phone or id")
                     continue
-                # A template was attempted (not necessarily confirmed sent: a
-                # timed-out request may still have been delivered by Meta).
+                # A template was attempted within the window and the dialogue is
+                # not closed (see WaqLead.awaiting_reply_q). A plain SELECT: the
+                # hook never waits on the row lock the gate holds during a POST.
                 lead = (
                     WaqLead.objects.filter(
+                        WaqLead.awaiting_reply_q(),
                         Q(confirmation_attempted_at__gte=since)
                         | Q(reminder_attempted_at__gte=since)
                         | Q(confirmation_sent_at__gte=since),
                         phone=customer,
-                        state__in=WaqLead.WAITING_STATES,
                     )
                     .order_by(
                         F("confirmation_attempted_at").desc(nulls_last=True),
