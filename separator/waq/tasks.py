@@ -12,6 +12,7 @@ from datetime import timedelta
 
 from celery import shared_task
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from . import alerts, classify, localtime
@@ -77,11 +78,16 @@ def run_schedule():
     now = timezone.now()
     answer_deadline = now - timedelta(hours=cfg.no_answer_after_hours)
 
+    # Counted from the first template attempt, so a confirmation with an
+    # unknown outcome (timeout) also ends as no_answer.
     expired = WaqLead.objects.filter(
+        Q(confirmation_attempted_at__lte=answer_deadline) | Q(confirmation_sent_at__lte=answer_deadline),
         state__in=WaqLead.WAITING_STATES,
         replied_at__isnull=True,
-        confirmation_sent_at__lte=answer_deadline,
     ).update(state=WaqLead.STATE_NO_ANSWER)
+
+    if not cfg.reminder_enabled:
+        return {"no_answer": expired, "reminders": "disabled"}
 
     due = WaqLead.objects.filter(
         state=WaqLead.STATE_CONFIRMATION_SENT,
@@ -89,6 +95,7 @@ def run_schedule():
         reminder_sent_at__isnull=True,
         reminder_attempted_at__isnull=True,
         confirmation_sent_at__lte=now - timedelta(minutes=cfg.reminder_after_min),
+        confirmation_sent_at__gte=now - timedelta(minutes=cfg.reminder_before_min),
         confirmation_sent_at__gt=answer_deadline,
     ).order_by("confirmation_sent_at")
 

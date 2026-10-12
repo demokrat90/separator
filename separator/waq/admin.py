@@ -26,7 +26,9 @@ class WaqSettingsAdmin(admin.ModelAdmin):
             "Timing",
             {
                 "fields": (
+                    "reminder_enabled",
                     "reminder_after_min",
+                    "reminder_before_min",
                     "reminder_window_start",
                     "reminder_window_end",
                     "no_answer_after_hours",

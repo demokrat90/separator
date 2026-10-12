@@ -216,7 +216,7 @@ def test_a_repeated_task_never_sends_twice(cfg, graph):
 
 
 def test_reminder_uses_the_reminder_template(cfg, graph, hour):
-    lead = make_lead(state=WaqLead.STATE_CONFIRMATION_SENT, confirmation_sent_at=timezone.now() - timedelta(hours=4))
+    lead = make_lead(state=WaqLead.STATE_CONFIRMATION_SENT, confirmation_sent_at=timezone.now() - timedelta(hours=3, minutes=10))
     WaqPhone.objects.create(phone=CUSTOMER, last_contacted_at=lead.confirmation_sent_at)
     # The 30-day rule is for confirmations only: the reminder goes out.
     assert gate(lead.id, KIND_REMINDER).sent
@@ -326,7 +326,7 @@ def test_confirmation_timeout_is_final_and_counts_as_contact(cfg, monkeypatch, a
     assert gate(lead.id, KIND_CONFIRMATION).status == "skipped"
     assert len(calls) == 1
     lead.refresh_from_db()
-    assert lead.state == WaqLead.STATE_FAILED
+    assert lead.state == WaqLead.STATE_CONFIRMATION_UNKNOWN  # not failed: it may be out
     # Meta may have accepted it: the number stays "contacted" for the 30 days.
     assert WaqPhone.objects.get(phone=CUSTOMER).last_contacted_at is not None
     assert WaqEvent.objects.get(kind=WaqEvent.KIND_SEND_ERROR).data["ambiguous"] is True
@@ -335,7 +335,7 @@ def test_confirmation_timeout_is_final_and_counts_as_contact(cfg, monkeypatch, a
 
 def test_reminder_after_a_timeout_is_never_sent_again(cfg, monkeypatch, hour):
     calls = _timeout(monkeypatch)
-    lead = make_lead(state=WaqLead.STATE_CONFIRMATION_SENT, confirmation_sent_at=timezone.now() - timedelta(hours=4))
+    lead = make_lead(state=WaqLead.STATE_CONFIRMATION_SENT, confirmation_sent_at=timezone.now() - timedelta(hours=3, minutes=10))
     assert gate(lead.id, KIND_REMINDER).status == "failed"
     # A second scheduler run (or a parallel one that waited on the lock).
     assert gate(lead.id, KIND_REMINDER).status == "skipped"
@@ -386,8 +386,95 @@ def test_manual_stop_pressed_right_before_the_request_wins(cfg, graph, monkeypat
 
 def test_reminder_window_is_rechecked_by_the_gate(cfg, graph, hour):
     hour["hours"] = [21]
-    lead = make_lead(state=WaqLead.STATE_CONFIRMATION_SENT, confirmation_sent_at=timezone.now() - timedelta(hours=4))
+    lead = make_lead(state=WaqLead.STATE_CONFIRMATION_SENT, confirmation_sent_at=timezone.now() - timedelta(hours=3, minutes=10))
     assert gate(lead.id, KIND_REMINDER).status == gate_module.REASON_OUTSIDE_WINDOW
     assert graph.calls == []
     lead.refresh_from_db()
     assert lead.reminder_attempted_at is None  # it can still go out tomorrow morning
+
+
+# ------------------------------------------------- last look right before the POST
+
+
+def _change_after_the_attempt(monkeypatch, change):
+    """Run `change` after the checks of step A, before the request."""
+    real_build = gate_module.build_template_payload
+
+    def build_then_change(cfg_row, lead, kind):
+        change(lead)
+        return real_build(cfg_row, lead, kind)
+
+    monkeypatch.setattr(gate_module, "build_template_payload", build_then_change)
+
+
+def test_autostop_switched_on_just_before_the_request_wins(cfg, graph, monkeypatch):
+    _change_after_the_attempt(monkeypatch, lambda lead: WaqSettings.objects.filter(pk=1).update(autostop_active=True))
+    lead = make_lead()
+    assert gate(lead.id, KIND_CONFIRMATION).status == gate_module.REASON_AUTOSTOP
+    assert graph.calls == []
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_BLOCKED and lead.block_reason == "autostop"
+    assert lead.confirmation_attempted_at is not None  # the attempt stays recorded
+    assert gate(lead.id, KIND_CONFIRMATION).status == "skipped"
+
+
+def test_opt_out_just_before_the_request_wins(cfg, graph, monkeypatch):
+    _change_after_the_attempt(
+        monkeypatch, lambda lead: WaqPhone.objects.filter(phone=lead.phone).update(opted_out=True)
+    )
+    lead = make_lead()
+    assert gate(lead.id, KIND_CONFIRMATION).status == gate_module.REASON_STOPLIST
+    assert graph.calls == []
+    assert WaqPhone.objects.get(phone=CUSTOMER).last_contacted_at is None  # nothing went out
+
+
+@pytest.mark.parametrize("closed", [WaqLead.STATE_STOPPED, WaqLead.STATE_QUALIFIED])
+def test_reminder_for_a_lead_closed_just_before_the_request_is_dropped(cfg, graph, monkeypatch, hour, closed):
+    _change_after_the_attempt(
+        monkeypatch,
+        lambda lead: WaqLead.objects.filter(pk=lead.pk).update(state=closed, replied_at=timezone.now()),
+    )
+    lead = make_lead(state=WaqLead.STATE_CONFIRMATION_SENT, confirmation_sent_at=timezone.now() - timedelta(hours=3, minutes=10))
+    assert gate(lead.id, KIND_REMINDER).status == gate_module.REASON_LEAD_CHANGED
+    assert graph.calls == []
+    lead.refresh_from_db()
+    assert lead.state == closed  # untouched
+    assert "reminder not sent: lead_changed" in lead.last_error
+
+
+# --------------------------------------------- unknown outcome vs definite failure
+
+
+def test_meta_5xx_leaves_the_outcome_unknown(cfg, graph):
+    graph.error = "Service temporarily unavailable"
+    graph.status = 503
+    lead = make_lead()
+    assert gate(lead.id, KIND_CONFIRMATION).status == "failed"
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_CONFIRMATION_UNKNOWN
+    assert WaqPhone.objects.get(phone=CUSTOMER).last_contacted_at is not None
+
+
+def test_meta_4xx_is_a_definite_failure(cfg, graph):
+    graph.error = "Template does not exist"
+    graph.status = 404
+    lead = make_lead()
+    gate(lead.id, KIND_CONFIRMATION)
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_FAILED
+    assert WaqPhone.objects.get(phone=CUSTOMER).last_contacted_at is None
+
+
+# ------------------------------------------------------------------- reminders off
+
+
+def test_reminders_are_off_by_default(db):
+    assert WaqSettings().reminder_enabled is False
+
+
+def test_gate_refuses_a_reminder_when_reminders_are_off(cfg, graph, hour):
+    cfg.reminder_enabled = False
+    cfg.save()
+    lead = make_lead(state=WaqLead.STATE_CONFIRMATION_SENT, confirmation_sent_at=timezone.now() - timedelta(hours=3, minutes=10))
+    assert gate(lead.id, KIND_REMINDER).status == gate_module.REASON_REMINDER_DISABLED
+    assert graph.calls == []

@@ -47,6 +47,9 @@ def cfg(sender):
     settings_row.enabled = True
     settings_row.phone = sender
     settings_row.project_fallback = "Test Project Fallback"
+    # Off by default in production; the reminder tests need it on. The
+    # default itself is covered by test_reminders_are_off_by_default.
+    settings_row.reminder_enabled = True
     settings_row.save()
     return settings_row
 
@@ -54,6 +57,8 @@ def cfg(sender):
 @pytest.fixture()
 def graph(monkeypatch):
     """Fake Graph API: records every call, answers with a wamid."""
+    import requests
+
     from separator.waba import utils as waba_utils
 
     calls = []
@@ -61,10 +66,15 @@ def graph(monkeypatch):
     def fake_call_api(waba=None, endpoint=None, method="get", payload=None, **kwargs):
         calls.append({"endpoint": endpoint, "method": method, "payload": payload})
         if fake_call_api.error:
-            raise Exception({"error": {"message": fake_call_api.error, "code": 131000}})
+            # What call_api raises for an HTTP error answer from Graph.
+            response = requests.Response()
+            response.status_code = fake_call_api.status
+            details = {"error": {"message": fake_call_api.error, "code": 131000}}
+            raise Exception(details) from requests.HTTPError(response=response)
         return {"messages": [{"id": f"wamid.TEST{len(calls)}"}]}
 
     fake_call_api.error = None
+    fake_call_api.status = 400
     fake_call_api.calls = calls
     monkeypatch.setattr(waba_utils, "call_api", fake_call_api)
     return fake_call_api

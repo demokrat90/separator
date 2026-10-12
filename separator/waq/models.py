@@ -40,7 +40,12 @@ class WaqSettings(models.Model):
         max_length=255, blank=True, default="", help_text="Template {{1}} when the lead has no project"
     )
 
+    # Reminders are off until switched on in the admin.
+    reminder_enabled = models.BooleanField(default=False)
     reminder_after_min = models.PositiveIntegerField(default=180)
+    # No reminder later than this after the confirmation (e.g. not the next
+    # morning when the evening window closed in between).
+    reminder_before_min = models.PositiveIntegerField(default=240)
     reminder_window_start = models.PositiveSmallIntegerField(default=9)
     reminder_window_end = models.PositiveSmallIntegerField(default=20)
     no_answer_after_hours = models.PositiveIntegerField(default=24)
@@ -85,6 +90,9 @@ class WaqLead(models.Model):
     STATE_BLOCKED = "blocked"
     STATE_HELD = "held"
     STATE_CONFIRMATION_SENT = "confirmation_sent"
+    # The request timed out / failed without a definite rejection: Meta may
+    # have delivered it, so replies are still handled.
+    STATE_CONFIRMATION_UNKNOWN = "confirmation_unknown"
     STATE_REMINDER_SENT = "reminder_sent"
     STATE_QUALIFIED = "qualified"
     STATE_NOT_LEAD = "not_lead"
@@ -96,6 +104,7 @@ class WaqLead(models.Model):
         (STATE_BLOCKED, "blocked"),
         (STATE_HELD, "held (cap, manual review)"),
         (STATE_CONFIRMATION_SENT, "confirmation sent"),
+        (STATE_CONFIRMATION_UNKNOWN, "confirmation outcome unknown"),
         (STATE_REMINDER_SENT, "reminder sent"),
         (STATE_QUALIFIED, "qualified"),
         (STATE_NOT_LEAD, "not a lead"),
@@ -104,7 +113,7 @@ class WaqLead(models.Model):
         (STATE_FAILED, "failed"),
     ]
     # States in which the customer's reply is still awaited.
-    WAITING_STATES = (STATE_CONFIRMATION_SENT, STATE_REMINDER_SENT)
+    WAITING_STATES = (STATE_CONFIRMATION_SENT, STATE_CONFIRMATION_UNKNOWN, STATE_REMINDER_SENT)
 
     SOURCE_BUTTON = "button"
     SOURCE_LLM = "llm"
@@ -131,7 +140,7 @@ class WaqLead(models.Model):
     received_at = models.DateTimeField(default=timezone.now)
     payload = models.JSONField(default=dict, blank=True)
 
-    state = models.CharField(max_length=20, choices=STATE_CHOICES, default=STATE_RECEIVED, db_index=True)
+    state = models.CharField(max_length=24, choices=STATE_CHOICES, default=STATE_RECEIVED, db_index=True)
     block_reason = models.CharField(max_length=255, blank=True, default="")
     # Set under the gate's locks BEFORE the Graph request: a template whose
     # attempt is recorded is never sent again, even after an error or timeout.

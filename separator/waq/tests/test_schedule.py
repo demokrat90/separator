@@ -154,3 +154,35 @@ def test_any_answer_cancels_the_reminder_and_no_answer(cfg, graph, hour, monkeyp
     tasks.run_schedule()
     old.refresh_from_db()
     assert old.state != WaqLead.STATE_NO_ANSWER
+
+
+def test_reminders_off_send_nothing_but_no_answer_still_works(cfg, graph, hour):
+    cfg.reminder_enabled = False
+    cfg.save()
+    due = sent_lead(200)
+    old = sent_lead(25 * 60, phone="+15550100008")
+    result = tasks.run_schedule()
+    assert result["no_answer"] == 1
+    assert result["reminders"] == "disabled"  # the scheduler does not even ask the gate
+    assert graph.calls == []
+    due.refresh_from_db()
+    old.refresh_from_db()
+    assert due.state == WaqLead.STATE_CONFIRMATION_SENT
+    assert old.state == WaqLead.STATE_NO_ANSWER
+
+
+def test_no_late_reminder_after_its_time_frame(cfg, graph, hour):
+    # The evening window closed at 3 h; by the next morning it is too late.
+    sent_lead(5 * 60)
+    tasks.run_schedule()
+    assert graph.calls == []
+
+
+def test_unknown_outcome_lead_ends_as_no_answer(cfg, graph, hour):
+    lead = make_lead(
+        state=WaqLead.STATE_CONFIRMATION_UNKNOWN,
+        confirmation_attempted_at=timezone.now() - timedelta(hours=25),
+    )
+    tasks.run_schedule()
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_NO_ANSWER

@@ -9,6 +9,7 @@ import logging
 import re
 from datetime import timedelta
 
+from django.db.models import F, Q
 from django.utils import timezone
 
 logger = logging.getLogger("django")
@@ -101,13 +102,20 @@ def handle_inbound_value(value, phone=None):
                 if not customer or not message.get("id"):
                     handled.append("no phone or id")
                     continue
+                # A template was attempted (not necessarily confirmed sent: a
+                # timed-out request may still have been delivered by Meta).
                 lead = (
                     WaqLead.objects.filter(
+                        Q(confirmation_attempted_at__gte=since)
+                        | Q(reminder_attempted_at__gte=since)
+                        | Q(confirmation_sent_at__gte=since),
                         phone=customer,
                         state__in=WaqLead.WAITING_STATES,
-                        confirmation_sent_at__gte=since,
                     )
-                    .order_by("-confirmation_sent_at")
+                    .order_by(
+                        F("confirmation_attempted_at").desc(nulls_last=True),
+                        F("confirmation_sent_at").desc(nulls_last=True),
+                    )
                     .only("id")
                     .first()
                 )

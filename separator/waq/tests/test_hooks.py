@@ -229,3 +229,45 @@ def test_hook_publishes_with_short_broker_timeouts(cfg, monkeypatch):
     assert seen["max_retries"] == 0 and seen["retry_on_timeout"] is False
     assert published[0]["retry"] is False
     assert published[0]["connection"] is not None
+
+
+def test_reply_after_a_timed_out_confirmation_is_still_handled(cfg, monkeypatch, alerts_sent):
+    """Meta may have delivered a confirmation whose request timed out: the
+    customer's "Yes" must still reach process_reply and qualify the lead."""
+    import requests
+
+    from separator.waba import utils as waba_utils
+    from separator.waq.gate import KIND_CONFIRMATION, gate
+
+    def timed_out(**kwargs):
+        raise requests.Timeout("read timed out")
+
+    monkeypatch.setattr(waba_utils, "call_api", timed_out)
+    lead = make_lead()
+    assert gate(lead.id, KIND_CONFIRMATION).status == "failed"
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_CONFIRMATION_UNKNOWN
+    assert lead.confirmation_sent_at is None
+
+    queued = []
+    monkeypatch.setattr(tasks.process_reply, "apply_async", lambda *a, **kw: queued.append(kw["args"]))
+    value = inbound()
+    value["messages"][0] = {
+        "id": "wamid.YES",
+        "from": CUSTOMER.lstrip("+"),
+        "type": "button",
+        "button": {"text": "Yes, it was me", "payload": "Yes, it was me"},
+    }
+    assert hooks.handle_inbound_value(value, cfg.phone) == ["queued"]
+
+    monkeypatch.setattr(tasks, "_send_reply", lambda *a, **kw: tasks.REPLY_EMPTY)
+    monkeypatch.setattr(tasks, "_update_deal", lambda *a, **kw: None)
+    monkeypatch.setattr(tasks, "_timeline_comment", lambda *a, **kw: None)
+    assert tasks.process_reply(*queued[0]) == "qualified"
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_QUALIFIED
+
+
+def test_definitely_failed_confirmation_is_not_waited_on(cfg, queued):
+    make_lead(state=WaqLead.STATE_FAILED, confirmation_attempted_at=timezone.now())
+    assert hooks.handle_inbound_value(inbound(), cfg.phone) == ["not ours"]
