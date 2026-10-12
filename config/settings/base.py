@@ -28,6 +28,17 @@ WABA_SEND_MEDIA_CAPTION_SEPARATELY = env.bool("WABA_SEND_MEDIA_CAPTION_SEPARATEL
 # Empty key = the /api/attr/ endpoints reject everything (fail closed).
 ATTR_API_KEY = env("ATTR_API_KEY", default="")
 
+# WhatsApp lead qualification (separator.waq).
+# HMAC secret shared with the site; empty = /api/waq/lead/ rejects everything (503).
+WAQ_HMAC_SECRET = env("WAQ_HMAC_SECRET", default="")
+# Telegram bot token for anomaly alerts; empty = alerts only go to the log.
+WAQ_TG_TOKEN = env("WAQ_TG_TOKEN", default="")
+# Claude API key for reply classification; empty = the "LLM unavailable" branch.
+ANTHROPIC_API_KEY = env("ANTHROPIC_API_KEY", default="")
+# Model and effort for the classification call.
+WAQ_ANTHROPIC_MODEL = env("WAQ_ANTHROPIC_MODEL", default="claude-opus-5-5")
+WAQ_ANTHROPIC_EFFORT = env("WAQ_ANTHROPIC_EFFORT", default="low")
+
 BITRIX_OAUTH_URL = env("BITRIX_OAUTH_URL", default="https://oauth.bitrix24.tech")
 BITRIX_TEMP_FILE_BASE_URL = env("BITRIX_TEMP_FILE_BASE_URL", default="")
 OPENAI_API_BASE_URL = env("OPENAI_API_BASE_URL", default="https://api.openai.com")
@@ -129,6 +140,7 @@ LOCAL_APPS = [
     "separator.voip",
     "separator.bitbot",
     "separator.attribution",
+    "separator.waq",
 ]
 
 # Asterisk Connector AsterX
@@ -378,6 +390,12 @@ CELERY_BEAT_SCHEDULE = {
         # Recovers attribution work whose follow-up task was never queued.
         "schedule": 600.0,
         "options": {"queue": "bitrix", "expires": 540},
+    },
+    "waq-run-schedule": {
+        "task": "separator.waq.tasks.run_schedule",
+        # Reminders (3-4 h after the confirmation, 9-20 local) and no-answer marking.
+        "schedule": 300.0,
+        "options": {"queue": "default", "expires": 280},
     },
 }
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#worker-send-task-events

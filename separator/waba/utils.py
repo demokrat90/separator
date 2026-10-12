@@ -26,6 +26,7 @@ import separator.bitrix.utils as bitrix_utils
 from separator.waba.bot import bot_processor
 from separator.waba.retry import RETRY_KWARGS, TRANSIENT_ERRORS
 from separator.attribution import hooks as attribution_hooks
+from separator.waq import hooks as waq_hooks
 
 from .models import (
     App,
@@ -861,6 +862,10 @@ def message_template_status_update(entry):
             raise Exception(f"Template not found: {entry}")
 
     else:
+        # Lead qualification templates (REJECTED, PAUSED, DISABLED, ...): record
+        # and alert instead of failing. Every other template keeps the old behaviour.
+        if waq_hooks.handle_template_status(value):
+            return f"waq template status recorded: {template_name} {event}"
         raise Exception(entry)
 
 def message_template_components_update(entry):
@@ -1624,6 +1629,12 @@ def event_processing(raw_body=None, signature=None, app_id=None, host=None):
             app_instance_id=str(appinstance.id) if appinstance else None,
             waba_phone_id=phone.phone_id if phone else None,
         )
+        # Lead qualification replies (own tables + a queued task; must never
+        # break or delay the path to Bitrix below).
+        try:
+            waq_hooks.handle_inbound_value(value, phone)
+        except Exception as exc:
+            logger.error(f"waq inbound hook failed: {exc}")
 
     # ctwa bot
     bot = Bot.objects.filter(phone=phone).first()
@@ -1667,6 +1678,11 @@ def event_processing(raw_body=None, signature=None, app_id=None, host=None):
                 pass
         else:
             raise
+
+    elif field == 'phone_number_quality_update':
+        # Messaging limit / quality rating change: record + alert (never raises).
+        waq_hooks.handle_quality_update(value)
+        return "phone quality update recorded"
     
     elif field == 'messages':
         if not appinstance or not phone.line_id or not phone.line.connector_id:
