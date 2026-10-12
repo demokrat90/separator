@@ -51,6 +51,10 @@ def bot(cfg, graph, alerts_sent, monkeypatch, settings):
     )
 
 
+def comment_payload(lead, text):
+    return {"fields": {"ENTITY_ID": lead.deal_id, "ENTITY_TYPE": "deal", "COMMENT": text}}
+
+
 def waiting_lead(**overrides):
     values = {
         "state": WaqLead.STATE_CONFIRMATION_SENT,
@@ -123,7 +127,10 @@ def test_no_button_opts_out_and_records_the_negative_reply(bot):
     assert event.data["form_type"] == "test_form"
     assert event.data["preferred_channel"] == "telegram"
     assert 590 <= event.data["seconds_from_lead"] <= 700
-    assert bot.bitrix == []  # no Bitrix action for a negative reply
+    # Stage untouched; a timeline comment; the bot reply mirrored to the operator.
+    assert bot.bitrix == [("crm.timeline.comment.add", comment_payload(lead, "AI: НЕ ЛИД · нажал «No, not me»"))]
+    assert bot.open_line[0]["args"][1:3] == [CUSTOMER, "NOTME-TEXT"]
+    assert bot.open_line[0]["countdown"] == 20 and bot.open_line[0]["kwargs"] == {"manager_id": 0}
 
 
 def test_same_message_id_twice_is_processed_once(bot, llm):
@@ -223,14 +230,80 @@ def test_empty_reply_text_still_runs_the_actions(bot):
     assert [method for method, _ in bot.bitrix] == ["crm.deal.update", "crm.timeline.comment.add"]
 
 
-def test_manual_stop_suppresses_the_bot_reply(bot):
+def test_manual_stop_blocks_the_reply_but_not_bitrix(bot):
     bot.cfg.enabled = False
     bot.cfg.save()
     lead = waiting_lead()
     tasks.process_reply(lead.id, button("Yes, it was me"))
-    assert bot.graph.calls == []
+    assert bot.graph.calls == []  # no outbound WhatsApp at all
+    assert bot.open_line == []  # nothing was sent, nothing to mirror
     lead.refresh_from_db()
     assert lead.state == WaqLead.STATE_QUALIFIED
+    assert [method for method, _ in bot.bitrix] == ["crm.deal.update", "crm.timeline.comment.add"]
+    assert bot.bitrix[0][1]["fields"] == {"STAGE_ID": "C0:TEST_STAGE", "ASSIGNED_BY_ID": 77}
+    assert bot.bitrix[1][1]["fields"]["COMMENT"] == (
+        "AI: КВАЛ · подтвердил заявку · Test Project · test_form · ответ клиенту не отправлен: ручной стоп"
+    )
+
+
+def test_manual_stop_note_on_a_negative_reply(bot):
+    bot.cfg.enabled = False
+    bot.cfg.save()
+    lead = waiting_lead()
+    tasks.process_reply(lead.id, button("No, not me"))
+    assert bot.graph.calls == []
+    assert bot.bitrix == [
+        (
+            "crm.timeline.comment.add",
+            comment_payload(lead, "AI: НЕ ЛИД · нажал «No, not me» · ответ клиенту не отправлен: ручной стоп"),
+        )
+    ]
+
+
+def test_autostop_blocks_only_templates_not_replies(bot):
+    bot.cfg.autostop_active = True
+    bot.cfg.autostop_reason = "test"
+    bot.cfg.save()
+    lead = waiting_lead()
+    assert tasks.process_reply(lead.id, button("Yes, it was me")) == "qualified"
+    assert sent_texts(bot.graph) == ["QUAL-TEXT"]
+    assert len(bot.open_line) == 1
+    assert [method for method, _ in bot.bitrix] == ["crm.deal.update", "crm.timeline.comment.add"]
+    assert "не отправлен" not in bot.bitrix[1][1]["fields"]["COMMENT"]
+
+
+@pytest.mark.parametrize(
+    "label, reply, comment",
+    [
+        (classify.STOP, "STOP-TEXT", "AI: СТОП"),
+        (classify.WHO, "WHO-TEXT Test Project", "AI: спросил „кто это“"),
+        (classify.COMPANY, "COMPANY-TEXT", "AI: спросил „какая компания“"),
+        (classify.NOT_LEAD, "NOTME-TEXT", "AI: НЕ ЛИД · по тексту ответа: не оставлял заявку / ошибся номером / спам / не по делу"),
+        (classify.BOT, "BOT-TEXT", "AI: КВАЛ · спросил, не бот ли · Test Project · test_form"),
+        (classify.QUAL_QUESTION, "QUESTION-TEXT", "AI: КВАЛ · задал вопрос по объекту · Test Project · test_form"),
+    ],
+)
+def test_every_bot_reply_is_mirrored_and_commented(bot, llm, label, reply, comment):
+    llm.label = label
+    lead = waiting_lead()
+    tasks.process_reply(lead.id, text_message("some text"))
+    assert sent_texts(bot.graph) == [reply]
+    assert len(bot.open_line) == 1
+    assert bot.open_line[0]["args"][1:3] == [CUSTOMER, reply]
+    assert bot.open_line[0]["countdown"] == 20
+    comments = [data["fields"]["COMMENT"] for method, data in bot.bitrix if method == "crm.timeline.comment.add"]
+    assert comments == [comment]
+    updates = [method for method, _ in bot.bitrix if method == "crm.deal.update"]
+    # The stage changes only for a qualified lead, never for NOT_LEAD / STOP / WHO / COMPANY.
+    assert len(updates) == (1 if label in (classify.BOT, classify.QUAL_QUESTION) else 0)
+
+
+def test_failed_reply_is_noted_and_not_mirrored(bot):
+    bot.graph.error = "outside the 24h window"
+    lead = waiting_lead()
+    tasks.process_reply(lead.id, button("Yes, it was me"))
+    assert bot.open_line == []
+    assert bot.bitrix[-1][1]["fields"]["COMMENT"].endswith("ответ клиенту не отправлен: ошибка отправки")
 
 
 def test_bitrix_failure_does_not_cancel_the_rest(bot, monkeypatch):

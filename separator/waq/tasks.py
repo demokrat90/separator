@@ -34,6 +34,23 @@ COMMENT_LABELS = {
     classify.BOT: "спросил, не бот ли",
 }
 MEDIA_LABEL = "медиа, не расшифровано"
+NOT_LEAD_BUTTON_LABEL = "нажал «No, not me»"
+NOT_LEAD_TEXT_LABEL = "по тексту ответа: не оставлял заявку / ошибся номером / спам / не по делу"
+OUTCOME_COMMENTS = {
+    classify.STOP: "AI: СТОП",
+    classify.WHO: "AI: спросил „кто это“",
+    classify.COMPANY: "AI: спросил „какая компания“",
+}
+
+# _send_reply() outcomes
+REPLY_SENT = "sent"
+REPLY_EMPTY = "empty"  # no text configured: nothing to send, by design
+REPLY_MANUAL_STOP = "manual_stop"
+REPLY_FAILED = "failed"
+REPLY_NOTES = {
+    REPLY_MANUAL_STOP: "ответ клиенту не отправлен: ручной стоп",
+    REPLY_FAILED: "ответ клиенту не отправлен: ошибка отправки",
+}
 
 
 # --------------------------------------------------------------------------- send
@@ -238,18 +255,32 @@ def process_reply(lead_id, message):
         )
         return "unclassified"
 
+    # 1. Reply to the customer. Only the manual stop blocks it (autostop is
+    #    about templates; the customer wrote to us first).
     reply = (_reply_text(cfg, lead, label) or "").strip()
-    sent = _send_reply(cfg, lead, reply) if reply else False
+    reply_status = _send_reply(cfg, lead, reply) if reply else REPLY_EMPTY
+    # 2. The operator sees every message the bot actually sent.
+    if reply_status == REPLY_SENT:
+        _show_in_open_line(cfg, lead, reply)
 
-    if label in (classify.QUAL, classify.QUAL_QUESTION, classify.BOT):
-        if sent:
-            _show_in_open_line(cfg, lead, reply)
+    # 3. Deal: stage/responsible only for a qualified lead; a timeline comment
+    #    for every outcome (Bitrix actions run even under the manual stop).
+    is_qual = label in (classify.QUAL, classify.QUAL_QUESTION, classify.BOT)
+    if is_qual:
         _update_deal(cfg, lead)
         detail = MEDIA_LABEL if source == WaqLead.SOURCE_MEDIA else COMMENT_LABELS[label]
         parts = ["AI: КВАЛ", detail, lead.project or "", lead.form_type or ""]
-        _timeline_comment(cfg, lead, " · ".join(part for part in parts if part))
-        return "qualified"
+    elif label == classify.NOT_LEAD:
+        detail = NOT_LEAD_BUTTON_LABEL if source == WaqLead.SOURCE_BUTTON else NOT_LEAD_TEXT_LABEL
+        parts = ["AI: НЕ ЛИД", detail]
+    else:
+        parts = [OUTCOME_COMMENTS[label]]
+    if reply_status in REPLY_NOTES:
+        parts.append(REPLY_NOTES[reply_status])
+    _timeline_comment(cfg, lead, " · ".join(part for part in parts if part))
 
+    if is_qual:
+        return "qualified"
     if label == classify.NOT_LEAD:
         check_autostop()
         return "not_lead"
@@ -269,14 +300,18 @@ def _record_failure(lead, kind, error):
 
 
 def _send_reply(cfg, lead, text):
-    """Session text message (the customer's reply opened the window)."""
-    if not cfg.enabled or cfg.autostop_active:
-        # "Nothing is sent" while stopped - bot replies included.
-        _record_failure(lead, WaqEvent.KIND_REPLY_ERROR, "suppressed: sending is stopped")
-        return False
+    """Session text message (the customer's reply opened the window).
+
+    Returns one of REPLY_SENT / REPLY_MANUAL_STOP / REPLY_FAILED. The autostop
+    does not apply here: it only blocks templates (see gate.py).
+    """
+    if not cfg.enabled:
+        # Manual stop is the emergency brake: no outbound WhatsApp at all.
+        _record_failure(lead, WaqEvent.KIND_REPLY_ERROR, "suppressed: manual stop")
+        return REPLY_MANUAL_STOP
     if cfg.phone is None or not cfg.phone.phone_id or not cfg.phone.waba_id:
         _record_failure(lead, WaqEvent.KIND_REPLY_ERROR, "no sender phone")
-        return False
+        return REPLY_FAILED
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
@@ -286,11 +321,11 @@ def _send_reply(cfg, lead, text):
     }
     try:
         post_message(cfg.phone, payload)
-        return True
+        return REPLY_SENT
     except Exception as exc:
         logger.error("waq: bot reply failed for deal %s: %s", lead.deal_id, exc)
         _record_failure(lead, WaqEvent.KIND_REPLY_ERROR, exc)
-        return False
+        return REPLY_FAILED
 
 
 def _app_instance(cfg):
