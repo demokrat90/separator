@@ -1,26 +1,26 @@
 """Celery tasks: confirmation send, reminder / no-answer scheduler, reply handling.
 
-Send tasks run with acks_late=False (at most once): a task re-delivered after a
-worker crash must not become a second template. The gate re-checks the lead
-state under a lock anyway.
+All waq tasks run on their own queue `waq` (own worker): a slow Claude or Graph
+call never holds the single slot that the Bitrix open-line traffic uses.
+
+Send tasks run with acks_late=False (at most once); the gate additionally
+records every attempt before the request and never repeats it.
 """
 
 import logging
 from datetime import timedelta
-from zoneinfo import ZoneInfo
 
 from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
 
-from . import alerts, classify
+from . import alerts, classify, localtime
 from .gate import KIND_CONFIRMATION, KIND_REMINDER, gate, post_message
 from .models import WaqEvent, WaqLead, WaqPhone, WaqSettings
 
 logger = logging.getLogger("django")
 
-QUEUE = "default"
-DEFAULT_TZ = "Asia/Dubai"
+QUEUE = "waq"
 OPEN_LINE_DELAY_SECONDS = 20
 
 AUTOSTOP_NEGATIVE_ABS = 3
@@ -47,10 +47,13 @@ REPLY_SENT = "sent"
 REPLY_EMPTY = "empty"  # no text configured: nothing to send, by design
 REPLY_MANUAL_STOP = "manual_stop"
 REPLY_FAILED = "failed"
+REPLY_CLOSED = "closed"  # another message closed the dialogue first
 REPLY_NOTES = {
     REPLY_MANUAL_STOP: "ответ клиенту не отправлен: ручной стоп",
     REPLY_FAILED: "ответ клиенту не отправлен: ошибка отправки",
+    REPLY_CLOSED: "ответ клиенту не отправлен: диалог уже закрыт",
 }
+CLOSED_STATES = (WaqLead.STATE_QUALIFIED, WaqLead.STATE_NOT_LEAD, WaqLead.STATE_STOPPED)
 
 
 # --------------------------------------------------------------------------- send
@@ -62,35 +65,14 @@ def send_confirmation(lead_id):
     return result.status
 
 
-def lead_timezone(phone):
-    """First time zone of the number's country/region; Asia/Dubai if unknown."""
-    try:
-        import phonenumbers
-        from phonenumbers import timezone as pn_timezone
-
-        zones = pn_timezone.time_zones_for_number(phonenumbers.parse(phone, None))
-        for zone in zones or ():
-            if zone and zone != "Etc/Unknown":
-                return ZoneInfo(zone)
-    except Exception as exc:  # unparseable number, or phonenumbers without tz data
-        logger.info("waq: no time zone for a lead number (%s), using %s", type(exc).__name__, DEFAULT_TZ)
-    return ZoneInfo(DEFAULT_TZ)
-
-
-def local_hour(phone, now=None):
-    now = now or timezone.now()
-    return now.astimezone(lead_timezone(phone)).hour
-
-
-def _reminder_failed_before(lead):
-    return WaqEvent.objects.filter(
-        lead=lead, kind=WaqEvent.KIND_SEND_ERROR, data__kind=KIND_REMINDER
-    ).exists()
-
-
 @shared_task(queue=QUEUE, acks_late=False, ignore_result=True)
 def run_schedule():
-    """Every 5 minutes: mark no-answer leads, then send due reminders."""
+    """Every 5 minutes: mark no-answer leads, then send due reminders.
+
+    Only leads that never answered at all (replied_at is empty) get a reminder
+    or become no_answer. The local-hour window is checked here as a cheap
+    filter and again by the gate, under its locks, right before sending.
+    """
     cfg = WaqSettings.load()
     now = timezone.now()
     answer_deadline = now - timedelta(hours=cfg.no_answer_after_hours)
@@ -105,18 +87,15 @@ def run_schedule():
         state=WaqLead.STATE_CONFIRMATION_SENT,
         replied_at__isnull=True,
         reminder_sent_at__isnull=True,
+        reminder_attempted_at__isnull=True,
         confirmation_sent_at__lte=now - timedelta(minutes=cfg.reminder_after_min),
         confirmation_sent_at__gt=answer_deadline,
     ).order_by("confirmation_sent_at")
 
     outcomes = {}
     for lead in due:
-        hour = local_hour(lead.phone, now)
-        if not (cfg.reminder_window_start <= hour < cfg.reminder_window_end):
+        if not localtime.in_window(lead.phone, cfg.reminder_window_start, cfg.reminder_window_end, now):
             outcomes["outside_window"] = outcomes.get("outside_window", 0) + 1
-            continue
-        if _reminder_failed_before(lead):
-            outcomes["failed_before"] = outcomes.get("failed_before", 0) + 1
             continue
         status = gate(lead.id, KIND_REMINDER).status
         outcomes[status] = outcomes.get(status, 0) + 1
@@ -207,7 +186,13 @@ def process_reply(lead_id, message):
             llm_error_kind = "unsure"
 
     now = timezone.now()
+    if label == classify.NOT_LEAD:
+        WaqSettings.load()  # the row must exist before it is locked below
     with transaction.atomic():
+        if label == classify.NOT_LEAD:
+            # Lock order settings -> lead -> phone, as in the gate: the autostop
+            # check below happens in this same transaction.
+            locked_cfg = WaqSettings.objects.select_for_update(of=("self",)).get(pk=WaqSettings.SINGLETON_PK)
         lead = WaqLead.objects.select_for_update().filter(pk=lead_id).first()
         if lead is None or lead.state not in WaqLead.WAITING_STATES:
             return "not waiting"
@@ -218,6 +203,23 @@ def process_reply(lead_id, message):
             kind=WaqEvent.KIND_REPLY,
             data={"message_id": message_id, "type": message.get("type"), "class": label, "source": source},
         )
+        # Any inbound message is an answer: no reminder, no no_answer after it.
+        update = []
+        if lead.replied_at is None:
+            lead.replied_at = now
+            update.append("replied_at")
+        if label in (classify.QUAL, classify.QUAL_QUESTION, classify.BOT):
+            lead.state = WaqLead.STATE_QUALIFIED
+            lead.outcome_source = source or ""
+            update += ["state", "outcome_source"]
+        elif label in (classify.NOT_LEAD, classify.STOP):
+            is_stop = label == classify.STOP
+            lead.state = WaqLead.STATE_STOPPED if is_stop else WaqLead.STATE_NOT_LEAD
+            lead.outcome_source = source or ""
+            update += ["state", "outcome_source"]
+        if update:
+            lead.save(update_fields=update)
+
         if label == classify.IGNORED:
             return "ignored"
         if label == classify.UNSURE:
@@ -226,23 +228,16 @@ def process_reply(lead_id, message):
                 kind=WaqEvent.KIND_LLM_ERROR,
                 data={"deal_id": lead.deal_id, "error_kind": llm_error_kind, "error": llm_error},
             )
-        elif label in (classify.QUAL, classify.QUAL_QUESTION, classify.BOT):
-            lead.state = WaqLead.STATE_QUALIFIED
-            lead.replied_at = now
-            lead.outcome_source = source or ""
-            lead.save(update_fields=["state", "replied_at", "outcome_source"])
         elif label in (classify.NOT_LEAD, classify.STOP):
-            is_stop = label == classify.STOP
-            lead.state = WaqLead.STATE_STOPPED if is_stop else WaqLead.STATE_NOT_LEAD
-            lead.replied_at = now
-            lead.outcome_source = source or ""
-            lead.save(update_fields=["state", "replied_at", "outcome_source"])
             _opt_out(lead.phone, "stop" if is_stop else "not_me", now)
             WaqEvent.objects.create(
                 lead=lead,
                 kind=WaqEvent.KIND_STOP if is_stop else WaqEvent.KIND_NEGATIVE_REPLY,
                 data=_negative_event_data(lead, now),
             )
+            if not is_stop:
+                # Before any external call: a crash later must not skip the autostop.
+                _autostop_if_needed(locked_cfg, now)
         # WHO / COMPANY: the lead keeps waiting.
 
     cfg = WaqSettings.load()
@@ -256,16 +251,18 @@ def process_reply(lead_id, message):
         return "unclassified"
 
     # 1. Reply to the customer. Only the manual stop blocks it (autostop is
-    #    about templates; the customer wrote to us first).
+    #    about templates; the customer wrote to us first). The closing reply
+    #    belongs to the state this message set; WHO/COMPANY only while waiting.
+    is_qual = label in (classify.QUAL, classify.QUAL_QUESTION, classify.BOT)
+    allowed_states = (lead.state,) if lead.state in CLOSED_STATES else WaqLead.WAITING_STATES
     reply = (_reply_text(cfg, lead, label) or "").strip()
-    reply_status = _send_reply(cfg, lead, reply) if reply else REPLY_EMPTY
+    reply_status = _send_reply(lead.id, reply, allowed_states) if reply else REPLY_EMPTY
     # 2. The operator sees every message the bot actually sent.
     if reply_status == REPLY_SENT:
         _show_in_open_line(cfg, lead, reply)
 
     # 3. Deal: stage/responsible only for a qualified lead; a timeline comment
     #    for every outcome (Bitrix actions run even under the manual stop).
-    is_qual = label in (classify.QUAL, classify.QUAL_QUESTION, classify.BOT)
     if is_qual:
         _update_deal(cfg, lead)
         detail = MEDIA_LABEL if source == WaqLead.SOURCE_MEDIA else COMMENT_LABELS[label]
@@ -282,7 +279,6 @@ def process_reply(lead_id, message):
     if is_qual:
         return "qualified"
     if label == classify.NOT_LEAD:
-        check_autostop()
         return "not_lead"
     if label == classify.STOP:
         return "stopped"
@@ -299,33 +295,40 @@ def _record_failure(lead, kind, error):
         logger.error("waq: could not record %s: %s", kind, exc)
 
 
-def _send_reply(cfg, lead, text):
+def _send_reply(lead_id, text, allowed_states):
     """Session text message (the customer's reply opened the window).
 
-    Returns one of REPLY_SENT / REPLY_MANUAL_STOP / REPLY_FAILED. The autostop
-    does not apply here: it only blocks templates (see gate.py).
+    Runs under the lead's row lock, so two replies for one lead never race:
+    the lead state and the manual stop are both read right before the request.
+    Returns REPLY_SENT / REPLY_CLOSED / REPLY_MANUAL_STOP / REPLY_FAILED. The
+    autostop does not apply here: it only blocks templates (see gate.py).
     """
-    if not cfg.enabled:
-        # Manual stop is the emergency brake: no outbound WhatsApp at all.
-        _record_failure(lead, WaqEvent.KIND_REPLY_ERROR, "suppressed: manual stop")
-        return REPLY_MANUAL_STOP
-    if cfg.phone is None or not cfg.phone.phone_id or not cfg.phone.waba_id:
-        _record_failure(lead, WaqEvent.KIND_REPLY_ERROR, "no sender phone")
-        return REPLY_FAILED
-    payload = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": lead.phone.lstrip("+"),
-        "type": "text",
-        "text": {"body": text},
-    }
-    try:
-        post_message(cfg.phone, payload)
-        return REPLY_SENT
-    except Exception as exc:
-        logger.error("waq: bot reply failed for deal %s: %s", lead.deal_id, exc)
-        _record_failure(lead, WaqEvent.KIND_REPLY_ERROR, exc)
-        return REPLY_FAILED
+    with transaction.atomic():
+        lead = WaqLead.objects.select_for_update().get(pk=lead_id)
+        if lead.state not in allowed_states:
+            return REPLY_CLOSED
+        cfg = WaqSettings.objects.select_related("phone", "phone__waba").get(pk=WaqSettings.SINGLETON_PK)
+        if not cfg.enabled:
+            # Manual stop is the emergency brake: no outbound WhatsApp at all.
+            _record_failure(lead, WaqEvent.KIND_REPLY_ERROR, "suppressed: manual stop")
+            return REPLY_MANUAL_STOP
+        if cfg.phone is None or not cfg.phone.phone_id or not cfg.phone.waba_id:
+            _record_failure(lead, WaqEvent.KIND_REPLY_ERROR, "no sender phone")
+            return REPLY_FAILED
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": lead.phone.lstrip("+"),
+            "type": "text",
+            "text": {"body": text},
+        }
+        try:
+            post_message(cfg.phone, payload)
+            return REPLY_SENT
+        except Exception as exc:
+            logger.error("waq: bot reply failed for deal %s: %s", lead.deal_id, exc)
+            _record_failure(lead, WaqEvent.KIND_REPLY_ERROR, exc)
+            return REPLY_FAILED
 
 
 def _app_instance(cfg):
@@ -397,33 +400,36 @@ def _timeline_comment(cfg, lead, comment):
 
 
 def check_autostop():
-    """After a NOT_LEAD: >=3 negative replies in 24h, or >=5 confirmations in
-    24h with more than 30% negative replies -> stop sending until cleared by hand."""
-    now = timezone.now()
-    since = now - timedelta(hours=24)
+    """Stand-alone check (own transaction); process_reply uses _autostop_if_needed."""
     WaqSettings.load()
     with transaction.atomic():
         cfg = WaqSettings.objects.select_for_update().get(pk=WaqSettings.SINGLETON_PK)
-        if cfg.autostop_active:
-            return False
-        negatives = WaqEvent.objects.filter(
-            kind=WaqEvent.KIND_NEGATIVE_REPLY, created_at__gte=since
-        ).count()
-        confirmations = WaqLead.objects.filter(confirmation_sent_at__gte=since).count()
-        reason = ""
-        if negatives >= AUTOSTOP_NEGATIVE_ABS:
-            reason = f"{negatives} negative replies in 24h"
-        elif confirmations >= AUTOSTOP_MIN_CONFIRMATIONS and negatives / confirmations > AUTOSTOP_NEGATIVE_SHARE:
-            reason = f"{negatives} negative replies to {confirmations} confirmations in 24h"
-        if not reason:
-            return False
-        cfg.autostop_active = True
-        cfg.autostop_reason = reason
-        cfg.autostop_at = now
-        cfg.save(update_fields=["autostop_active", "autostop_reason", "autostop_at"])
-        WaqEvent.objects.create(
-            kind=WaqEvent.KIND_AUTOSTOP,
-            data={"reason": reason, "negatives": negatives, "confirmations": confirmations},
-        )
-        alerts.alert_on_commit(f"AUTOSTOP: {reason}. Sending stopped until cleared in the admin.")
+        return _autostop_if_needed(cfg, timezone.now())
+
+
+def _autostop_if_needed(cfg, now):
+    """After a NOT_LEAD: >=3 negative replies in 24h, or >=5 confirmations in
+    24h with more than 30% negative replies -> stop templates until cleared by
+    hand. `cfg` must be locked (select_for_update) by the caller's transaction."""
+    if cfg.autostop_active:
+        return False
+    since = now - timedelta(hours=24)
+    negatives = WaqEvent.objects.filter(kind=WaqEvent.KIND_NEGATIVE_REPLY, created_at__gte=since).count()
+    confirmations = WaqLead.objects.filter(confirmation_sent_at__gte=since).count()
+    reason = ""
+    if negatives >= AUTOSTOP_NEGATIVE_ABS:
+        reason = f"{negatives} negative replies in 24h"
+    elif confirmations >= AUTOSTOP_MIN_CONFIRMATIONS and negatives / confirmations > AUTOSTOP_NEGATIVE_SHARE:
+        reason = f"{negatives} negative replies to {confirmations} confirmations in 24h"
+    if not reason:
+        return False
+    cfg.autostop_active = True
+    cfg.autostop_reason = reason
+    cfg.autostop_at = now
+    cfg.save(update_fields=["autostop_active", "autostop_reason", "autostop_at"])
+    WaqEvent.objects.create(
+        kind=WaqEvent.KIND_AUTOSTOP,
+        data={"reason": reason, "negatives": negatives, "confirmations": confirmations},
+    )
+    alerts.alert_on_commit(f"AUTOSTOP: {reason}. Templates stopped until cleared in the admin.")
     return True

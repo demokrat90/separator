@@ -9,7 +9,7 @@ import pytest
 from django.urls import reverse
 
 from separator.waq import tasks
-from separator.waq.models import WaqLead
+from separator.waq.models import WaqLead, WaqSettings
 
 from .conftest import CUSTOMER
 
@@ -34,8 +34,11 @@ BODY = {
 
 
 @pytest.fixture(autouse=True)
-def _secret(settings):
+def _secret(settings, db):
     settings.WAQ_HMAC_SECRET = SECRET
+    enabled = WaqSettings.load()
+    enabled.enabled = True
+    enabled.save()
     from django.core.cache import cache
 
     cache.clear()
@@ -196,3 +199,18 @@ def test_rate_limited_per_ip(client, queued):
     for i in range(62):
         codes.add(post(client, body={**BODY, "deal_id": 7000 + i}).status_code)
     assert codes == {202, 429}
+
+
+def test_lead_received_under_manual_stop_is_blocked_and_never_queued(
+    client, queued, django_capture_on_commit_callbacks
+):
+    stop = WaqSettings.load()
+    stop.enabled = False
+    stop.save()
+    with django_capture_on_commit_callbacks(execute=True):
+        response = post(client)
+    assert response.status_code == 202
+    assert response.json() == {"status": "blocked", "reason": "manual_stop"}
+    lead = WaqLead.objects.get()
+    assert lead.state == WaqLead.STATE_BLOCKED and lead.block_reason == "manual_stop"
+    assert queued == []

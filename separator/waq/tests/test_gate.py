@@ -38,7 +38,8 @@ def test_all_clear_sends_the_utility_template(cfg, graph, alerts_sent):
     assert lead.state == WaqLead.STATE_CONFIRMATION_SENT
     assert lead.confirmation_wamid == "wamid.TEST1"
     assert lead.confirmation_sent_at is not None
-    assert WaqPhone.objects.get(phone=CUSTOMER).last_contacted_at == lead.confirmation_sent_at
+    # Contact time = the attempt, recorded before the request.
+    assert WaqPhone.objects.get(phone=CUSTOMER).last_contacted_at == lead.confirmation_attempted_at
     assert alerts_sent == []
 
 
@@ -78,7 +79,8 @@ def test_manual_stop_sends_nothing_and_keeps_the_lead(cfg, graph):
     assert gate(lead.id, KIND_CONFIRMATION).status == gate_module.REASON_MANUAL_STOP
     assert graph.calls == []
     lead.refresh_from_db()
-    assert lead.state == WaqLead.STATE_RECEIVED
+    # Final: switching the bot on later never sends this lead's confirmation.
+    assert lead.state == WaqLead.STATE_BLOCKED and lead.block_reason == "manual_stop"
 
 
 def test_settings_are_off_by_default(db, graph, sender):
@@ -125,8 +127,14 @@ def test_number_contacted_31_days_ago_is_sent(cfg, graph):
 
 
 def _sent_leads(count, ago, field="confirmation_sent_at"):
+    attempt_field = field.replace("_sent_at", "_attempted_at")
     for i in range(count):
-        make_lead(phone=f"+1555010{1000 + i}", state=WaqLead.STATE_CONFIRMATION_SENT, **{field: timezone.now() - ago})
+        when = timezone.now() - ago
+        make_lead(
+            phone=f"+1555010{1000 + i}",
+            state=WaqLead.STATE_CONFIRMATION_SENT,
+            **{field: when, attempt_field: when},
+        )
 
 
 def test_hourly_cap_holds_the_lead_and_alerts_once_per_hour(
@@ -207,7 +215,7 @@ def test_a_repeated_task_never_sends_twice(cfg, graph):
     assert len(graph.calls) == 1
 
 
-def test_reminder_uses_the_reminder_template(cfg, graph):
+def test_reminder_uses_the_reminder_template(cfg, graph, hour):
     lead = make_lead(state=WaqLead.STATE_CONFIRMATION_SENT, confirmation_sent_at=timezone.now() - timedelta(hours=4))
     WaqPhone.objects.create(phone=CUSTOMER, last_contacted_at=lead.confirmation_sent_at)
     # The 30-day rule is for confirmations only: the reminder goes out.
@@ -270,3 +278,116 @@ def test_two_leads_for_one_number_at_once_send_exactly_one_template(sender, monk
     assert sorted(results.values()) == sorted(["sent", gate_module.REASON_CONTACTED_30D])
     states = sorted(WaqLead.objects.values_list("state", flat=True))
     assert states == sorted([WaqLead.STATE_CONFIRMATION_SENT, WaqLead.STATE_BLOCKED])
+
+
+# ---------------------------------------------------- review fixes (at most once etc.)
+
+
+def test_failed_attempts_count_toward_the_cap(cfg, graph):
+    for i in range(10):
+        make_lead(phone=f"+1555010{4000 + i}", state=WaqLead.STATE_FAILED, confirmation_attempted_at=timezone.now())
+    lead = make_lead()
+    assert gate(lead.id, KIND_CONFIRMATION).status == gate_module.REASON_CAP
+
+
+def test_stale_lead_is_never_confirmed(cfg, graph):
+    lead = make_lead(received_at=timezone.now() - timedelta(minutes=31))
+    assert gate(lead.id, KIND_CONFIRMATION).status == gate_module.REASON_STALE
+    assert graph.calls == []
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_BLOCKED and lead.block_reason == "stale"
+
+
+def test_fresh_lead_is_not_stale(cfg, graph):
+    lead = make_lead(received_at=timezone.now() - timedelta(minutes=29))
+    assert gate(lead.id, KIND_CONFIRMATION).sent
+
+
+def _timeout(monkeypatch):
+    import requests
+
+    from separator.waba import utils as waba_utils
+
+    calls = []
+
+    def timed_out(**kwargs):
+        calls.append(kwargs)
+        raise requests.Timeout("read timed out")
+
+    monkeypatch.setattr(waba_utils, "call_api", timed_out)
+    return calls
+
+
+def test_confirmation_timeout_is_final_and_counts_as_contact(cfg, monkeypatch, alerts_sent, django_capture_on_commit_callbacks):
+    calls = _timeout(monkeypatch)
+    lead = make_lead()
+    with django_capture_on_commit_callbacks(execute=True):
+        assert gate(lead.id, KIND_CONFIRMATION).status == "failed"
+    assert gate(lead.id, KIND_CONFIRMATION).status == "skipped"
+    assert len(calls) == 1
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_FAILED
+    # Meta may have accepted it: the number stays "contacted" for the 30 days.
+    assert WaqPhone.objects.get(phone=CUSTOMER).last_contacted_at is not None
+    assert WaqEvent.objects.get(kind=WaqEvent.KIND_SEND_ERROR).data["ambiguous"] is True
+    assert len(alerts_sent) == 1 and "not retried" in alerts_sent[0]
+
+
+def test_reminder_after_a_timeout_is_never_sent_again(cfg, monkeypatch, hour):
+    calls = _timeout(monkeypatch)
+    lead = make_lead(state=WaqLead.STATE_CONFIRMATION_SENT, confirmation_sent_at=timezone.now() - timedelta(hours=4))
+    assert gate(lead.id, KIND_REMINDER).status == "failed"
+    # A second scheduler run (or a parallel one that waited on the lock).
+    assert gate(lead.id, KIND_REMINDER).status == "skipped"
+    assert len(calls) == 1
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_CONFIRMATION_SENT
+    assert lead.reminder_attempted_at is not None
+
+
+class WorkerKilled(BaseException):
+    pass
+
+
+def test_worker_dying_during_the_request_never_leads_to_a_resend(cfg, monkeypatch):
+    from separator.waba import utils as waba_utils
+
+    calls = []
+
+    def dies(**kwargs):
+        calls.append(kwargs)
+        raise WorkerKilled()
+
+    monkeypatch.setattr(waba_utils, "call_api", dies)
+    lead = make_lead()
+    with pytest.raises(WorkerKilled):
+        gate(lead.id, KIND_CONFIRMATION)
+    # Redelivered task: the attempt is on record, nothing is sent again.
+    assert gate(lead.id, KIND_CONFIRMATION).status == "skipped"
+    assert len(calls) == 1
+
+
+def test_manual_stop_pressed_right_before_the_request_wins(cfg, graph, monkeypatch):
+    real_build = gate_module.build_template_payload
+
+    def build_then_stop(cfg_row, lead, kind):
+        # The admin switches the bot off after the checks, before the POST.
+        WaqSettings.objects.filter(pk=1).update(enabled=False)
+        return real_build(cfg_row, lead, kind)
+
+    monkeypatch.setattr(gate_module, "build_template_payload", build_then_stop)
+    lead = make_lead()
+    assert gate(lead.id, KIND_CONFIRMATION).status == gate_module.REASON_MANUAL_STOP
+    assert graph.calls == []
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_BLOCKED
+    assert WaqPhone.objects.get(phone=CUSTOMER).last_contacted_at is None
+
+
+def test_reminder_window_is_rechecked_by_the_gate(cfg, graph, hour):
+    hour["hours"] = [21]
+    lead = make_lead(state=WaqLead.STATE_CONFIRMATION_SENT, confirmation_sent_at=timezone.now() - timedelta(hours=4))
+    assert gate(lead.id, KIND_REMINDER).status == gate_module.REASON_OUTSIDE_WINDOW
+    assert graph.calls == []
+    lead.refresh_from_db()
+    assert lead.reminder_attempted_at is None  # it can still go out tomorrow morning

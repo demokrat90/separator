@@ -395,7 +395,7 @@ CELERY_BEAT_SCHEDULE = {
         "task": "separator.waq.tasks.run_schedule",
         # Reminders (3-4 h after the confirmation, 9-20 local) and no-answer marking.
         "schedule": 300.0,
-        "options": {"queue": "default", "expires": 280},
+        "options": {"queue": "waq", "expires": 280},
     },
 }
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#worker-send-task-events
@@ -426,6 +426,7 @@ CELERY_QUEUES = (
     Queue('waba'),
     Queue('waba_messages'),
     Queue('bitbot'),
+    Queue('waq'),
 )
 
 

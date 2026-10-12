@@ -68,7 +68,7 @@ def test_waiting_lead_gets_its_reply_queued(cfg, queued):
         "payload": None,
     }
     # The customer's profile name never travels into the task.
-    assert "Test Person" not in json.dumps(kwargs)
+    assert "Test Person" not in json.dumps(kwargs["args"])
 
 
 def test_qualified_or_old_leads_are_not_picked_up(cfg, queued):
@@ -197,3 +197,35 @@ def test_other_templates_keep_the_old_behaviour(cfg, unsigned, alerts_sent):
         waba_utils.event_processing(raw_body=raw)
     assert WaqEvent.objects.count() == 0
     assert alerts_sent == []
+
+
+# ------------------------------------------------------------ broker publish
+
+
+def test_hook_publishes_with_short_broker_timeouts(cfg, monkeypatch):
+    """A real kombu publish (in-memory broker): the message lands, and the
+    connection the hook used carries 1 s timeouts and no publish retries."""
+    waiting_lead()
+    app = tasks.process_reply.app
+    seen = {}
+    real_connection_for_write = app.connection_for_write
+
+    def recording_connection_for_write(*args, **kwargs):
+        seen.update(kwargs.get("transport_options") or {})
+        return real_connection_for_write("memory://", **kwargs)
+
+    monkeypatch.setattr(app, "connection_for_write", recording_connection_for_write)
+    published = []
+    real_apply_async = tasks.process_reply.apply_async
+
+    def recording_apply_async(*args, **kwargs):
+        published.append(kwargs)
+        return real_apply_async(*args, **kwargs)
+
+    monkeypatch.setattr(tasks.process_reply, "apply_async", recording_apply_async)
+
+    assert hooks.handle_inbound_value(inbound(), cfg.phone) == ["queued"]
+    assert seen["socket_timeout"] == 1 and seen["socket_connect_timeout"] == 1
+    assert seen["max_retries"] == 0 and seen["retry_on_timeout"] is False
+    assert published[0]["retry"] is False
+    assert published[0]["connection"] is not None

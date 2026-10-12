@@ -97,3 +97,18 @@ def make_lead(**overrides):
     }
     values.update(overrides)
     return WaqLead.objects.create(**values)
+
+
+@pytest.fixture()
+def hour(monkeypatch):
+    """Pin the lead's local hour (a list = successive answers, last one repeats)."""
+    from separator.waq import localtime
+
+    state = {"hours": [10]}
+
+    def fake_local_hour(phone, now=None):
+        hours = state["hours"]
+        return hours.pop(0) if len(hours) > 1 else hours[0]
+
+    monkeypatch.setattr(localtime, "local_hour", fake_local_hour)
+    return state

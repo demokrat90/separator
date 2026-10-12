@@ -6,20 +6,12 @@ from datetime import timezone as dt_timezone
 import pytest
 from django.utils import timezone
 
-from separator.waq import tasks
+from separator.waq import localtime, tasks
 from separator.waq.models import WaqEvent, WaqLead
 
 from .conftest import make_lead
 
 pytestmark = pytest.mark.django_db
-
-
-@pytest.fixture()
-def hour(monkeypatch):
-    """Pin the lead's local hour."""
-    state = {"hour": 10}
-    monkeypatch.setattr(tasks, "local_hour", lambda phone, now=None: state["hour"])
-    return state
 
 
 def sent_lead(minutes_ago, **overrides):
@@ -48,7 +40,7 @@ def test_no_reminder_before_180_minutes(cfg, graph, hour):
 
 @pytest.mark.parametrize("local", [8, 20, 23, 0])
 def test_no_reminder_outside_9_to_20(cfg, graph, hour, local):
-    hour["hour"] = local
+    hour["hours"] = [local]
     sent_lead(200)
     assert tasks.run_schedule()["outside_window"] == 1
     assert graph.calls == []
@@ -56,7 +48,7 @@ def test_no_reminder_outside_9_to_20(cfg, graph, hour, local):
 
 @pytest.mark.parametrize("local", [9, 19])
 def test_window_edges_are_inside(cfg, graph, hour, local):
-    hour["hour"] = local
+    hour["hours"] = [local]
     sent_lead(200)
     tasks.run_schedule()
     assert len(graph.calls) == 1
@@ -93,8 +85,8 @@ def test_failed_reminder_keeps_waiting_and_is_not_retried(cfg, graph, hour):
     assert lead.state == WaqLead.STATE_CONFIRMATION_SENT  # the reply is still awaited
     assert WaqEvent.objects.filter(kind=WaqEvent.KIND_SEND_ERROR).count() == 1
     graph.error = None
-    assert tasks.run_schedule().get("failed_before") == 1
-    assert len(graph.calls) == 1
+    tasks.run_schedule()
+    assert len(graph.calls) == 1  # never retried
 
 
 def test_no_answer_after_24_hours(cfg, graph, hour):
@@ -110,13 +102,55 @@ def test_no_answer_after_24_hours(cfg, graph, hour):
 
 
 def test_local_time_zone_from_the_number():
-    assert str(tasks.lead_timezone("+971500000000")) == "Asia/Dubai"
-    assert str(tasks.lead_timezone("+12125550100")).startswith("America/")
+    assert str(localtime.lead_timezone("+971500000000")) == "Asia/Dubai"
+    assert str(localtime.lead_timezone("+12125550100")).startswith("America/")
     # Unknown or unparseable -> Dubai.
-    assert str(tasks.lead_timezone("+15550100001")) == "Asia/Dubai"
-    assert str(tasks.lead_timezone("garbage")) == "Asia/Dubai"
+    assert str(localtime.lead_timezone("+15550100001")) == "Asia/Dubai"
+    assert str(localtime.lead_timezone("garbage")) == "Asia/Dubai"
 
 
 def test_local_hour_uses_the_zone():
     noon_utc = datetime(2026, 10, 12, 12, 0, tzinfo=dt_timezone.utc)
-    assert tasks.local_hour("+971500000000", noon_utc) == 16
+    assert localtime.local_hour("+971500000000", noon_utc) == 16
+
+
+def test_window_closing_during_the_run_stops_the_reminder(cfg, graph, hour):
+    # 19:59 when the scheduler looks, 20:00 when the gate is about to send.
+    hour["hours"] = [19, 20]
+    lead = sent_lead(200)
+    assert tasks.run_schedule().get("outside_window") == 1
+    assert graph.calls == []
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_CONFIRMATION_SENT
+
+
+@pytest.mark.parametrize("label_message", ["who", "company", "media", "sticker", "unclassified"])
+def test_any_answer_cancels_the_reminder_and_no_answer(cfg, graph, hour, monkeypatch, settings, label_message):
+    from separator.waq import classify
+
+    settings.ANTHROPIC_API_KEY = ""
+    monkeypatch.setattr(tasks, "_timeline_comment", lambda *a, **kw: None)
+    monkeypatch.setattr(tasks, "_show_in_open_line", lambda *a, **kw: None)
+    monkeypatch.setattr(tasks.alerts, "send_alert", lambda text: True)
+    if label_message in ("who", "company"):
+        label = classify.WHO if label_message == "who" else classify.COMPANY
+        monkeypatch.setattr(classify, "classify_text", lambda text, project: label)
+    message = {
+        "who": {"id": "wamid.W", "type": "text", "text": "who is this"},
+        "company": {"id": "wamid.C", "type": "text", "text": "which company"},
+        "media": {"id": "wamid.M", "type": "audio"},
+        "sticker": {"id": "wamid.S", "type": "sticker"},
+        "unclassified": {"id": "wamid.U", "type": "text", "text": "hm"},
+    }[label_message]
+    lead = sent_lead(200)
+    tasks.process_reply(lead.id, message)
+    lead.refresh_from_db()
+    assert lead.replied_at is not None
+    graph.calls.clear()
+    tasks.run_schedule()
+    assert [c for c in graph.calls if c["payload"]["type"] == "template"] == []
+    old = sent_lead(25 * 60, phone="+15550100009")
+    tasks.process_reply(old.id, {**message, "id": message["id"] + "-old"})
+    tasks.run_schedule()
+    old.refresh_from_db()
+    assert old.state != WaqLead.STATE_NO_ANSWER

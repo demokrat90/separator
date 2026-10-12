@@ -21,7 +21,7 @@ from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
-from separator.waq.models import WaqEvent, WaqLead
+from separator.waq.models import WaqEvent, WaqLead, WaqSettings
 
 logger = logging.getLogger("django")
 
@@ -255,6 +255,11 @@ def lead(request):
     if blocked:
         values["state"] = WaqLead.STATE_BLOCKED
         values["block_reason"] = values["wa_reason"]
+    elif not WaqSettings.load().enabled:
+        # Manual stop at the moment of arrival: recorded only, never sent later.
+        blocked = True
+        values["state"] = WaqLead.STATE_BLOCKED
+        values["block_reason"] = "manual_stop"
     try:
         with transaction.atomic():
             lead_obj = WaqLead.objects.create(**values)
@@ -263,7 +268,7 @@ def lead(request):
         return _json({"status": "duplicate"}, 202)
 
     if blocked:
-        return _json({"status": "blocked", "reason": values["wa_reason"]}, 202)
+        return _json({"status": "blocked", "reason": values["block_reason"]}, 202)
 
     # ATOMIC_REQUESTS: queue only after the lead row is committed.
     transaction.on_commit(lambda: _queue_confirmation(lead_obj.id))

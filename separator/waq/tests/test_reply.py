@@ -545,3 +545,109 @@ def test_model_and_effort_defaults(fake_sdk, settings):
     request = fake_sdk.requests[0]
     assert request["model"] == "claude-opus-5-5"
     assert request["output_config"]["effort"] == "low"
+
+
+# ------------------------------------------------------------- review fixes
+
+
+def test_autostop_is_on_before_any_external_call(bot, monkeypatch):
+    """The third negative reply: by the time the bot answers, the autostop is
+    already committed - and it stays on even if the worker dies mid-reply."""
+    _negatives(2)
+    seen = []
+
+    class WorkerKilled(BaseException):
+        pass
+
+    def reply_post(sender, payload):
+        seen.append(
+            (
+                WaqSettings.objects.get(pk=1).autostop_active,
+                WaqEvent.objects.filter(kind=WaqEvent.KIND_NEGATIVE_REPLY).count(),
+            )
+        )
+        raise WorkerKilled()
+
+    monkeypatch.setattr(tasks, "post_message", reply_post)
+    lead = waiting_lead()
+    with pytest.raises(WorkerKilled):
+        tasks.process_reply(lead.id, button("No, not me"))
+    assert seen == [(True, 3)]
+    assert WaqSettings.load().autostop_active is True
+    assert bot.bitrix == []  # Bitrix comes after the reply; never reached here
+
+
+def test_manual_stop_pressed_just_before_the_reply_wins(bot, monkeypatch):
+    real_reply_text = tasks._reply_text
+
+    def text_then_stop(cfg, lead, label):
+        WaqSettings.objects.filter(pk=1).update(enabled=False)
+        return real_reply_text(cfg, lead, label)
+
+    monkeypatch.setattr(tasks, "_reply_text", text_then_stop)
+    lead = waiting_lead()
+    tasks.process_reply(lead.id, button("Yes, it was me"))
+    assert bot.graph.calls == []
+    assert bot.bitrix[-1][1]["fields"]["COMMENT"].endswith("ответ клиенту не отправлен: ручной стоп")
+
+
+def test_who_reply_is_dropped_if_the_dialogue_closed_meanwhile(bot, llm, monkeypatch):
+    llm.label = classify.WHO
+    real_reply_text = tasks._reply_text
+
+    def text_after_another_message_closed_it(cfg, lead, label):
+        # A "Yes, it was me" processed in parallel has just qualified the lead.
+        WaqLead.objects.filter(pk=lead.pk).update(state=WaqLead.STATE_QUALIFIED)
+        return real_reply_text(cfg, lead, label)
+
+    monkeypatch.setattr(tasks, "_reply_text", text_after_another_message_closed_it)
+    lead = waiting_lead()
+    tasks.process_reply(lead.id, text_message("who is this?"))
+    assert bot.graph.calls == []
+    assert bot.open_line == []
+    assert bot.bitrix[-1][1]["fields"]["COMMENT"] == "AI: спросил „кто это“ · ответ клиенту не отправлен: диалог уже закрыт"
+
+
+def test_who_sets_replied_at(bot, llm):
+    llm.label = classify.WHO
+    lead = waiting_lead()
+    tasks.process_reply(lead.id, text_message("who is this?"))
+    lead.refresh_from_db()
+    assert lead.replied_at is not None
+    assert lead.state == WaqLead.STATE_CONFIRMATION_SENT
+
+
+def test_first_reply_time_is_kept(bot, llm):
+    llm.label = classify.WHO
+    lead = waiting_lead()
+    tasks.process_reply(lead.id, text_message("who is this?", message_id="wamid.T1"))
+    lead.refresh_from_db()
+    first = lead.replied_at
+    tasks.process_reply(lead.id, button("Yes, it was me", message_id="wamid.B9"))
+    lead.refresh_from_db()
+    assert lead.state == WaqLead.STATE_QUALIFIED
+    assert lead.replied_at == first
+
+
+def test_waq_tasks_and_beat_use_their_own_queue(settings):
+    assert tasks.QUEUE == "waq"
+    for task in (tasks.send_confirmation, tasks.run_schedule, tasks.process_reply):
+        assert task.queue == "waq"
+    assert settings.CELERY_BEAT_SCHEDULE["waq-run-schedule"]["options"]["queue"] == "waq"
+    assert "waq" in [queue.name for queue in settings.CELERY_QUEUES]
+
+
+def test_compose_has_a_waq_worker_and_keeps_the_others():
+    from pathlib import Path
+
+    import yaml
+    from django.conf import settings as django_settings
+
+    compose = yaml.safe_load(Path(django_settings.BASE_DIR, "docker-compose.photon.yml").read_text())
+    services = compose["services"]
+    waq = services["worker-waq"]
+    assert waq["environment"]["CELERY_QUEUE"] == "waq"
+    assert waq["environment"]["CELERY_CONCURRENCY"] == "1"
+    assert waq["command"] == "/start-celeryworker"
+    assert services["worker-misc"]["environment"]["CELERY_QUEUE"] == "bitrix,default,bitbot,olx,waweb"
+    assert services["worker-waba"]["environment"]["CELERY_QUEUE"] == "waba,waba_messages"

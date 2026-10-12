@@ -1,26 +1,31 @@
 """The single "may we send?" check, run right before every template request to Meta.
 
-Everything happens in one transaction:
-  1. lock WaqSettings (pk=1) - serializes every template send, so the caps are
-     counted without races;
-  2. lock the lead and re-check its state - a re-delivered or duplicated task
-     can never send a second template;
-  3. lock the customer's WaqPhone row - dedup (30 days) and the stop list.
-Lock order is always settings -> lead -> phone (process_reply takes lead -> phone
-and touches settings only in a separate transaction), so there is no cycle.
+Two short transactions around one Graph request, at most once per template:
 
-The Graph request itself is made inside the transaction, as the spec requires:
-while one template is in flight nobody else can pass the gate.
+  A. lock WaqSettings (pk=1), the lead, the customer's WaqPhone row (always in
+     this order - process_reply uses the same order), check every rule, then
+     RECORD THE ATTEMPT (`*_attempted_at`, WaqPhone.last_contacted_at) and commit.
+     The caps count attempts, so they stay race-free without holding the
+     settings lock during the HTTP call.
+  B. re-read `enabled` from the database right before the call; POST.
+  C. record the outcome. No automatic retry ever: an attempt that is on record
+     is never repeated, whatever happened to it (timeout, crash, Meta error).
+
+A definite rejection by Meta (an HTTP error answer) restores the number's
+last_contacted_at - nothing reached the customer. A timeout or a connection
+error does not: Meta may have accepted the message, so the number counts as
+contacted.
 """
 
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
 
+import requests
 from django.db import transaction
 from django.utils import timezone
 
-from . import alerts
+from . import alerts, localtime
 from .models import WaqEvent, WaqLead, WaqPhone, WaqSettings
 
 logger = logging.getLogger("django")
@@ -30,12 +35,16 @@ KIND_REMINDER = "reminder"
 
 DEDUP_DAYS = 30
 CAP_ALERT_EVERY = timedelta(hours=1)
+# A confirmation for a lead received longer ago than this is never sent.
+STALE_AFTER = timedelta(minutes=30)
 
 # Refusal reasons, in the order they are checked.
+REASON_STALE = "stale"
 REASON_MANUAL_STOP = "manual_stop"
 REASON_AUTOSTOP = "autostop"
 REASON_STOPLIST = "stoplist"
 REASON_CONTACTED_30D = "contacted_30d"
+REASON_OUTSIDE_WINDOW = "outside_window"
 REASON_CAP = "cap"
 REASON_MISCONFIGURED = "misconfigured"
 
@@ -50,7 +59,13 @@ class GateResult:
         return self.status == "sent"
 
 
+def _attempt_field(kind):
+    return "confirmation_attempted_at" if kind == KIND_CONFIRMATION else "reminder_attempted_at"
+
+
 def _expected_state(lead, kind):
+    if getattr(lead, _attempt_field(kind)) is not None:
+        return False  # at most once: an attempt on record is final
     if kind == KIND_CONFIRMATION:
         return lead.state == WaqLead.STATE_RECEIVED and lead.confirmation_sent_at is None
     return (
@@ -60,10 +75,10 @@ def _expected_state(lead, kind):
     )
 
 
-def templates_sent_since(since):
-    """Templates of both kinds actually sent since `since` (by *_sent_at)."""
-    confirmations = WaqLead.objects.filter(confirmation_sent_at__gte=since).count()
-    reminders = WaqLead.objects.filter(reminder_sent_at__gte=since).count()
+def templates_attempted_since(since):
+    """Templates of both kinds attempted since `since` (sent, in flight or failed)."""
+    confirmations = WaqLead.objects.filter(confirmation_attempted_at__gte=since).count()
+    reminders = WaqLead.objects.filter(reminder_attempted_at__gte=since).count()
     return confirmations + reminders
 
 
@@ -137,6 +152,12 @@ def post_message(sender_phone, payload):
     )
 
 
+def sending_enabled():
+    """The manual stop, read fresh from the database (no cached settings)."""
+    value = WaqSettings.objects.filter(pk=WaqSettings.SINGLETON_PK).values_list("enabled", flat=True).first()
+    return bool(value)
+
+
 def wamid_of(response):
     if not isinstance(response, dict):
         return None
@@ -151,6 +172,8 @@ def gate(lead_id, kind):
     if kind not in (KIND_CONFIRMATION, KIND_REMINDER):
         raise ValueError(f"unknown kind {kind}")
     WaqSettings.load()  # make sure the row exists before locking it
+
+    # ---- A. checks + attempt record, under locks
     with transaction.atomic():
         # of=("self",): lock only the settings row, not the joined phone/waba.
         cfg = (
@@ -168,10 +191,15 @@ def gate(lead_id, kind):
         phone_row = WaqPhone.objects.select_for_update().get(phone=lead.phone)
         now = timezone.now()
 
-        # 1. Manual stop: nothing is sent, the lead keeps its state.
+        # 0. A confirmation is for a fresh lead only.
+        if kind == KIND_CONFIRMATION and lead.received_at < now - STALE_AFTER:
+            _set(lead, state=WaqLead.STATE_BLOCKED, block_reason=REASON_STALE)
+            return GateResult(REASON_STALE)
+
+        # 1. Manual stop. A confirmation refused here is final (never sent later).
         if not cfg.enabled:
             if kind == KIND_CONFIRMATION:
-                _set(lead, block_reason=REASON_MANUAL_STOP)
+                _set(lead, state=WaqLead.STATE_BLOCKED, block_reason=REASON_MANUAL_STOP)
             return GateResult(REASON_MANUAL_STOP)
 
         # 2. Automatic stop.
@@ -193,9 +221,15 @@ def gate(lead_id, kind):
             _set(lead, state=WaqLead.STATE_BLOCKED, block_reason=REASON_CONTACTED_30D)
             return GateResult(REASON_CONTACTED_30D)
 
-        # 5. Hourly / daily caps over both template kinds.
-        last_hour = templates_sent_since(now - timedelta(hours=1))
-        last_day = templates_sent_since(now - timedelta(hours=24))
+        # 4a. Reminder: the local-hour window, checked here, right before sending.
+        if kind == KIND_REMINDER and not localtime.in_window(
+            lead.phone, cfg.reminder_window_start, cfg.reminder_window_end, now
+        ):
+            return GateResult(REASON_OUTSIDE_WINDOW)
+
+        # 5. Hourly / daily caps over both template kinds (attempts count).
+        last_hour = templates_attempted_since(now - timedelta(hours=1))
+        last_day = templates_attempted_since(now - timedelta(hours=24))
         if last_hour >= cfg.hourly_cap or last_day >= cfg.daily_cap:
             detail = f"sent last hour {last_hour}/{cfg.hourly_cap}, last 24h {last_day}/{cfg.daily_cap}"
             alert_due = _cap_alert_due(now)
@@ -225,49 +259,83 @@ def gate(lead_id, kind):
             alerts.alert_on_commit(f"misconfigured, {kind} not sent (deal {lead.deal_id}): {problem}")
             return GateResult(REASON_MISCONFIGURED, problem)
 
-        # All clear: send inside the same transaction.
+        # All clear: record the attempt BEFORE the request.
         payload = build_template_payload(cfg, lead, kind)
-        try:
-            response = post_message(cfg.phone, payload)
-            wamid = wamid_of(response)
-            if not wamid:
-                raise Exception(f"no wamid in Graph response: {str(response)[:500]}")
-        except Exception as exc:
-            error = str(exc)[:2000]
-            if kind == KIND_CONFIRMATION:
-                _set(lead, state=WaqLead.STATE_FAILED, last_error=f"{kind}: {error}")
-            else:
-                # The confirmation is out and its reply is still awaited: a failed
-                # reminder must not take the lead out of the waiting state. The
-                # send_error event below stops the scheduler from retrying it.
-                _set(lead, last_error=f"{kind}: {error}")
-            WaqEvent.objects.create(
-                lead=lead,
-                kind=WaqEvent.KIND_SEND_ERROR,
-                data={"deal_id": lead.deal_id, "kind": kind, "error": error},
-            )
-            alerts.alert_on_commit(f"{kind} send failed (deal {lead.deal_id}): {error[:500]}")
-            return GateResult("failed", error)
-
-        sent_at = timezone.now()
-        if kind == KIND_CONFIRMATION:
-            _set(
-                lead,
-                state=WaqLead.STATE_CONFIRMATION_SENT,
-                confirmation_wamid=wamid,
-                confirmation_sent_at=sent_at,
-                block_reason="",
-            )
-        else:
-            _set(
-                lead,
-                state=WaqLead.STATE_REMINDER_SENT,
-                reminder_wamid=wamid,
-                reminder_sent_at=sent_at,
-            )
-        phone_row.last_contacted_at = sent_at
+        sender = cfg.phone
+        _set(lead, **{_attempt_field(kind): now})
+        previous_contact = phone_row.last_contacted_at
+        phone_row.last_contacted_at = now
         phone_row.save(update_fields=["last_contacted_at"])
-        return GateResult("sent", wamid)
+        deal_id = lead.deal_id
+
+    # ---- B. the manual stop, read again right before the request
+    if not sending_enabled():
+        with transaction.atomic():
+            lead = WaqLead.objects.select_for_update().get(pk=lead_id)
+            if kind == KIND_CONFIRMATION:
+                _set(lead, state=WaqLead.STATE_BLOCKED, block_reason=REASON_MANUAL_STOP)
+            _restore_contact(lead.phone, now, previous_contact)
+        return GateResult(REASON_MANUAL_STOP, "stopped right before the request")
+
+    error = None
+    ambiguous = False
+    wamid = None
+    try:
+        wamid = wamid_of(post_message(sender, payload))
+        if not wamid:
+            error = "no wamid in Graph response"
+            ambiguous = True  # Graph answered 200: the message may well be out
+    except requests.RequestException as exc:
+        # Timeout / connection error: Meta may have accepted the message.
+        error = f"{type(exc).__name__}: {exc}"
+        ambiguous = True
+    except Exception as exc:
+        # An HTTP error answer from Graph: the message was rejected.
+        error = str(exc)
+
+    # ---- C. outcome
+    with transaction.atomic():
+        lead = WaqLead.objects.select_for_update().get(pk=lead_id)
+        if error is None:
+            sent_at = timezone.now()
+            if kind == KIND_CONFIRMATION:
+                fields = {"confirmation_wamid": wamid, "confirmation_sent_at": sent_at, "block_reason": ""}
+                if lead.state == WaqLead.STATE_RECEIVED:
+                    fields["state"] = WaqLead.STATE_CONFIRMATION_SENT
+            else:
+                fields = {"reminder_wamid": wamid, "reminder_sent_at": sent_at}
+                if lead.state == WaqLead.STATE_CONFIRMATION_SENT:
+                    fields["state"] = WaqLead.STATE_REMINDER_SENT
+            _set(lead, **fields)
+            return GateResult("sent", wamid)
+
+        error = error[:2000]
+        if kind == KIND_CONFIRMATION:
+            _set(lead, state=WaqLead.STATE_FAILED, last_error=f"{kind}: {error}")
+        else:
+            # The confirmation is out and its reply is still awaited: a failed
+            # reminder must not take the lead out of the waiting state.
+            _set(lead, last_error=f"{kind}: {error}")
+        if not ambiguous:
+            _restore_contact(lead.phone, now, previous_contact)
+        WaqEvent.objects.create(
+            lead=lead,
+            kind=WaqEvent.KIND_SEND_ERROR,
+            data={"deal_id": deal_id, "kind": kind, "error": error, "ambiguous": ambiguous},
+        )
+        alerts.alert_on_commit(
+            f"{kind} send failed{' (may have been delivered)' if ambiguous else ''}, "
+            f"not retried (deal {deal_id}): {error[:500]}"
+        )
+    return GateResult("failed", error)
+
+
+def _restore_contact(phone, attempted_at, previous):
+    """Undo our last_contacted_at if nothing has overwritten it since."""
+    row = WaqPhone.objects.select_for_update().filter(phone=phone).first()
+    if row is not None and row.last_contacted_at == attempted_at:
+        row.last_contacted_at = previous
+        row.save(update_fields=["last_contacted_at"])
 
 
 def _set(lead, **fields):

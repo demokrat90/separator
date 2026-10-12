@@ -133,6 +133,10 @@ class WaqLead(models.Model):
 
     state = models.CharField(max_length=20, choices=STATE_CHOICES, default=STATE_RECEIVED, db_index=True)
     block_reason = models.CharField(max_length=255, blank=True, default="")
+    # Set under the gate's locks BEFORE the Graph request: a template whose
+    # attempt is recorded is never sent again, even after an error or timeout.
+    confirmation_attempted_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    reminder_attempted_at = models.DateTimeField(null=True, blank=True, db_index=True)
     confirmation_wamid = models.CharField(max_length=255, blank=True, default="")
     confirmation_sent_at = models.DateTimeField(null=True, blank=True, db_index=True)
     reminder_wamid = models.CharField(max_length=255, blank=True, default="")

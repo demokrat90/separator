@@ -147,6 +147,28 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+  # WhatsApp lead qualification (separator.waq): its own slot, so a slow
+  # Claude or Graph call never delays the open-line traffic on worker-misc.
+  worker-waq:
+    <<: *django-common
+    container_name: separator-worker-waq
+    command: /start-celeryworker
+    hostname: waq
+    environment:
+      <<: *django-env
+      CELERY_QUEUE: waq
+      CELERY_CONCURRENCY: "1"
+      CELERY_MAX_MEMORY_PER_CHILD: "250000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
   beat:
     <<: *django-common
     container_name: separator-beat

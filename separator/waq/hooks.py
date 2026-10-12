@@ -14,6 +14,24 @@ from django.utils import timezone
 logger = logging.getLogger("django")
 
 REPLY_LOOKBACK_DAYS = 7
+# Broker timeouts for the hook's own publish. The rest of the webhook path
+# publishes with the global settings (5 s, with retries); the hook gets 1 s and
+# no retries, so a sick Redis costs the Bitrix path at most a couple of seconds.
+PUBLISH_TIMEOUT_SECONDS = 1
+
+
+def publish_reply(task, args):
+    """Queue `task` with short broker timeouts and no publish retries."""
+    app = task.app
+    with app.connection_for_write(
+        transport_options={
+            "socket_timeout": PUBLISH_TIMEOUT_SECONDS,
+            "socket_connect_timeout": PUBLISH_TIMEOUT_SECONDS,
+            "retry_on_timeout": False,
+            "max_retries": 0,
+        }
+    ) as connection:
+        task.apply_async(args=args, retry=False, connection=connection)
 
 
 def normalize_phone(value):
@@ -96,7 +114,7 @@ def handle_inbound_value(value, phone=None):
                 if lead is None:
                     handled.append("not ours")
                     continue
-                tasks.process_reply.apply_async(args=[lead.id, slim_message(message)], retry=False)
+                publish_reply(tasks.process_reply, [lead.id, slim_message(message)])
                 handled.append("queued")
             except Exception as exc:
                 logger.error("waq: inbound message hook failed: %s", exc)
